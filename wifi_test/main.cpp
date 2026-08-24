@@ -824,11 +824,17 @@ static void build_settings_screen()
 // LVGL objects must only ever be touched from the one task that also calls
 // lv_timer_handler().
 
-// Fallback only, used the very first time the watch boots with nothing
-// saved yet in NVS — real credentials come from the app over BLE (see
-// start_ble_provisioning() below) and are persisted from then on.
+// Pinned Wi-Fi credentials. load_wifi_credentials() below always returns
+// these now (NVS-saved/BLE-provisioned values are ignored) — see
+// BLE_PROVISIONING_ENABLED just below for why.
 static const char *WIFI_SSID_FALLBACK = "OWAIS_4G";
 static const char *WIFI_PASSWORD_FALLBACK = "0530331339";
+
+// BLE (Wi-Fi provisioning) is disabled for now — it was fighting the display
+// for the radio hardware often enough to visibly freeze/corrupt screen
+// transitions. Both start_ble_provisioning() call sites in network_task()
+// are gated on this, so the radio never turns on at all while it's false.
+static const bool BLE_PROVISIONING_ENABLED = false;
 
 #define BLE_PROVISIONING_DEVICE_NAME "Nabeeh-Watch-Setup"
 #define BLE_WIFI_SERVICE_UUID        "b19c1e70-1fc7-4b2b-9f5b-8f2e6f2b1a01"
@@ -943,25 +949,15 @@ static void change_wifi_cb(lv_event_t *e)
     ble_restart_requested = true;
 }
 
-// NVS-persisted (survives reboots/reflashes) — falls back to the hardcoded
-// dev credentials above only if nothing has ever been saved.
+// Pinned: always returns WIFI_SSID_FALLBACK/WIFI_PASSWORD_FALLBACK, ignoring
+// whatever's saved in NVS from earlier BLE provisioning. Re-enable the NVS
+// lookup below once BLE_PROVISIONING_ENABLED goes back to true.
 static void load_wifi_credentials(char *ssid_out, size_t ssid_len, char *pass_out, size_t pass_len)
 {
-    wifi_prefs.begin("nabeeh", true);
-    String saved_ssid = wifi_prefs.getString("wifi_ssid", "");
-    String saved_pass = wifi_prefs.getString("wifi_pass", "");
-    wifi_prefs.end();
-    if (saved_ssid.length() > 0) {
-        strncpy(ssid_out, saved_ssid.c_str(), ssid_len - 1);
-        ssid_out[ssid_len - 1] = '\0';
-        strncpy(pass_out, saved_pass.c_str(), pass_len - 1);
-        pass_out[pass_len - 1] = '\0';
-    } else {
-        strncpy(ssid_out, WIFI_SSID_FALLBACK, ssid_len - 1);
-        ssid_out[ssid_len - 1] = '\0';
-        strncpy(pass_out, WIFI_PASSWORD_FALLBACK, pass_len - 1);
-        pass_out[pass_len - 1] = '\0';
-    }
+    strncpy(ssid_out, WIFI_SSID_FALLBACK, ssid_len - 1);
+    ssid_out[ssid_len - 1] = '\0';
+    strncpy(pass_out, WIFI_PASSWORD_FALLBACK, pass_len - 1);
+    pass_out[pass_len - 1] = '\0';
 }
 
 static void save_wifi_credentials(const char *ssid, const char *pass)
@@ -1103,7 +1099,7 @@ static void network_task(void *pvParameters)
         Serial.print(".");
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED && BLE_PROVISIONING_ENABLED) {
         Serial.println();
         Serial.println("Could not connect with saved/fallback credentials — starting BLE provisioning.");
         start_ble_provisioning();
@@ -1117,9 +1113,13 @@ static void network_task(void *pvParameters)
         }
     }
     Serial.println();
-    Serial.println("Wi-Fi connected.");
-    Serial.print("Watch IP address: ");
-    Serial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Wi-Fi connected.");
+        Serial.print("Watch IP address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("Wi-Fi not connected yet — BLE provisioning is disabled, will keep retrying in the background.");
+    }
 
     server.begin();
     Serial.printf("TCP server listening on port %u\n", TCP_PORT);
@@ -1175,7 +1175,11 @@ static void network_task(void *pvParameters)
 
         if (ble_restart_requested) {
             ble_restart_requested = false;
-            start_ble_provisioning();
+            if (BLE_PROVISIONING_ENABLED) {
+                start_ble_provisioning();
+            } else {
+                Serial.println("Change-Wi-Fi requested, but BLE provisioning is disabled right now — ignoring.");
+            }
         }
 
         if (wifi_credentials_pending) {
@@ -1192,22 +1196,37 @@ static void network_task(void *pvParameters)
             wifi_reconnect_started = millis();
         }
 
-        if (!client || !client.connected()) {
+        // Checked unconditionally, every loop iteration — not just when the
+        // current client "looks" disconnected. client.connected() only goes
+        // false once this side notices a clean FIN; a phone app killed or
+        // backgrounded mid-connection (no clean close) leaves it reading
+        // true indefinitely, and the old gated version of this check never
+        // even looked at server.available() in that case — so a genuinely
+        // new incoming connection (the app reconnecting) would complete its
+        // TCP handshake at the OS level, then sit unread forever, because
+        // the sketch was still watching the stale client. A new connection
+        // always means the old one is stale (only one phone talks to this
+        // watch at a time), so it always wins immediately.
+        WiFiClient newClient = server.available();
+        if (newClient) {
+            if (client && client.connected()) {
+                Serial.println("New client connecting — dropping previous (stale) connection.");
+                client.stop();
+            }
+            client = newClient;
+            client.setNoDelay(true); // send audio chunks immediately, don't batch
+            was_connected = true;
+            streaming = false;
+            connection_start_millis = millis();
+            result_parse_state = RESULT_IDLE; // a previous connection can't leave half-read state behind
+            Serial.println("Client connected.");
+        } else if (!client || !client.connected()) {
             if (was_connected) {
                 Serial.println("Client disconnected.");
                 was_connected = false;
                 streaming = false;
                 last_disconnect_millis = millis();
                 ever_connected = true;
-            }
-            WiFiClient newClient = server.available();
-            if (newClient) {
-                client = newClient;
-                client.setNoDelay(true); // send audio chunks immediately, don't batch
-                was_connected = true;
-                connection_start_millis = millis();
-                result_parse_state = RESULT_IDLE; // a previous connection can't leave half-read state behind
-                Serial.println("Client connected.");
             }
         }
 
