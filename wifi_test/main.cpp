@@ -22,6 +22,31 @@
  *                   here — the app's 4th reminder-only pattern option
  *                   ("تصاعدي") gets clamped down to '3' before it's sent,
  *                   since this firmware has no 4th pattern to show it as.
+ *     '@' + list + '\n'
+ *                -> the phone's full reminder schedule. The watch stores it
+ *                   in NVS and fires each reminder from its own RTC, so a
+ *                   reminder still vibrates when the phone is asleep, out of
+ *                   Wi-Fi range, or dead. Entries are ';'-separated, fields
+ *                   ':'-separated:
+ *                       H:M:daysMask:pattern:intensity:once:label
+ *                   `label` is the reminder's own name, shown on the watch
+ *                   instead of the generic "تذكير". It is the last field so
+ *                   it may safely contain ':' — only ';' and newlines are
+ *                   reserved, and the phone strips those. It is optional: a
+ *                   schedule saved by an older build still loads.
+ *                   daysMask bit0=Monday .. bit6=Sunday (same 1..7 numbering
+ *                   as Dart's DateTime.weekday), once=1 means the entry is
+ *                   dropped after it fires. '@\n' alone clears the schedule.
+ *                   Replies "R,<count>\n" so the phone can confirm.
+ *                   The phone ALSO still sends '#T..' at the moment a
+ *                   reminder fires if it happens to be awake — whichever
+ *                   arrives first wins, the other is suppressed (see
+ *                   REMINDER_DUPLICATE_WINDOW_MS).
+ *     '?'        -> dump the full reminder state to Serial (stored schedule,
+ *                   RTC time, computed weekday, per-entry flags). The one
+ *                   command to run when a reminder didn't fire.
+ *     '!'        -> fire a test reminder immediately, ignoring the clock and
+ *                   the duplicate-suppression window.
  * Same commands work over USB Serial too (dev/testing convenience) — e.g.
  * typing "#B" in the Serial Monitor simulates a "باكاء أطفال" result
  * without needing the phone to send anything for real.
@@ -110,6 +135,151 @@ static const ResultCode result_codes[] = {
 };
 #define RESULT_CODE_COUNT (sizeof(result_codes) / sizeof(result_codes[0]))
 
+// ── جدول تذكيرات محفوظ داخل الساعة ────────────────────────────────────────
+// الساعة تخزّن مواعيد التذكيرات وتطلقها من ساعتها الداخلية (RTC)، فما تعتمد
+// على كون الجوال صاحيًا ولا على نفس شبكة الواي فاي وقت الموعد — وهذا مهم
+// لمستخدم أصم: السوار هو قناة التنبيه الأساسية، ما يصح تعتمد على جهاز ثاني.
+// الجوال يرسل الجدول كامل كل ما يتغيّر تذكير (وكل ما يتصل بالساعة)، والساعة
+// تحفظه بـNVS فيبقى بعد إعادة التشغيل.
+#define MAX_WATCH_REMINDERS 16
+// نافذة كتم التكرار: نفس التذكير ممكن يوصل مرتين — من ساعة الساعة نفسها، ومن
+// الجوال لو كان صاحيًا وقتها. أول واحد يوصل يشتغل والثاني يُتجاهل خلال هذي
+// النافذة. أقل من دقيقة عن قصد، عشان تذكيرين بدقيقتين متتاليتين يشتغلون عادي.
+#define REMINDER_DUPLICATE_WINDOW_MS 45000UL
+
+struct WatchReminder {
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t days_mask; // bit0=الاثنين .. bit6=الأحد
+    char pattern;      // '1'-'3' — نفس أرقام trigger_vibration
+    char intensity;    // '1'-'3'
+    bool once;         // تذكير غير متكرر: يُشطب بعد ما يشتغل
+    bool spent;
+    char label[64];    // اسم التذكير كما كتبه المستخدم؛ فاضي = نعرض "تذكير"
+};
+// فهرس فئة "تذكير" داخل alert_categories، مأخوذ من نفس جدول الأكواد بدل ما
+// يُكتب رقمًا ثابتًا هنا — عشان إضافة فئة جديدة فوق ما تكسره بصمت.
+static int reminder_category_index()
+{
+    for (size_t i = 0; i < RESULT_CODE_COUNT; i++) {
+        if (result_codes[i].code == 'T') return result_codes[i].category_index;
+    }
+    return -1;
+}
+
+// تشخيص: سطر لكل دقيقة يوضح وقت الساعة واليوم وعدد التذكيرات المخزّنة.
+// حطّه 0 بعد ما تستقر الميزة.
+#define REMINDER_DEBUG_LOG 1
+
+static WatchReminder watch_reminders[MAX_WATCH_REMINDERS];
+static int watch_reminder_count = 0;
+static volatile unsigned long last_reminder_dispatch_ms = 0;
+
+// يشيل أي حرف UTF-8 ناقص من نهاية النص. يصير فقط لو وصل اسم أطول من المخزن
+// فانقص بالنص — وبايت نصف حرف يطلع مربعًا فاضيًا على الشاشة بدل ما يُتجاهل.
+static void trim_incomplete_utf8(char *str)
+{
+    size_t len = strlen(str);
+    size_t i = len;
+    while (i > 0 && ((unsigned char)str[i - 1] & 0xC0) == 0x80) i--; // بايتات التكملة
+    if (i == 0) return;
+
+    unsigned char lead = (unsigned char)str[i - 1];
+    size_t need = (lead < 0x80)             ? 1
+                  : ((lead & 0xE0) == 0xC0) ? 2
+                  : ((lead & 0xF0) == 0xE0) ? 3
+                  : ((lead & 0xF8) == 0xF0) ? 4
+                                            : 1;
+    if ((i - 1) + need > len) str[i - 1] = '\0'; // الحرف الأخير ناقص
+}
+
+// يرجّع يوم الأسبوع ١=الاثنين .. ٧=الأحد (خوارزمية Sakamoto). نحسبه من
+// التاريخ بأنفسنا بدل ما نقرأ حقل يوم الأسبوع من الـRTC، لأن ذاك الحقل سجل
+// منفصل بالشريحة ولا يتحدّث تلقائيًا لما نضبط الوقت من NTP.
+static int weekday_iso(int y, int m, int d)
+{
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y -= 1;
+    int w = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7; // 0=الأحد
+    return w == 0 ? 7 : w;
+}
+
+// يفكّ "H:M:mask:pattern:intensity:once;H:M:..." — نص فاضي يعني مسح الجدول.
+// أي مقطع مشوّه يوقف القراءة عنده بدل ما تدخل بيانات نصف صحيحة للجدول.
+// يرجّع عدد التذكيرات بعد التحديث، أو ‎-1‎ لو رفض الرسالة وأبقى الجدول القديم.
+static int parse_reminder_payload(const char *payload)
+{
+    if (!payload) return -1;
+
+    // نفكّ لمصفوفة مؤقتة أولًا، وما نلمس الجدول الشغّال إلا لما نتأكد إن
+    // الرسالة سليمة. النسخة السابقة كانت تصفّر الجدول قبل ما تبدأ الفك، فأي
+    // رسالة وصلت ناقصة أو مشوّهة كانت تمسح كل التذكيرات بصمت.
+    WatchReminder parsed[MAX_WATCH_REMINDERS];
+    int count = 0;
+
+    const char *p = payload;
+    while (*p && count < MAX_WATCH_REMINDERS) {
+        int h = -1, m = -1, mask = -1, once = 0, consumed = 0;
+        char pat = 0, inten = 0;
+        if (sscanf(p, "%d:%d:%d:%c:%c:%d%n", &h, &m, &mask, &pat, &inten, &once, &consumed) != 6) {
+            Serial.printf("Reminders: مقطع غير صالح عند \"%.24s\" — توقفنا هنا\n", p);
+            break;
+        }
+        if (h < 0 || h > 23 || m < 0 || m > 59 || mask <= 0 || mask > 0x7F ||
+            (pat != '1' && pat != '2' && pat != '3') ||
+            (inten != '1' && inten != '2' && inten != '3')) {
+            Serial.printf("Reminders: قيم خارج المدى عند \"%.24s\" — توقفنا هنا\n", p);
+            break;
+        }
+
+        WatchReminder &r = parsed[count++];
+        r.hour = (uint8_t)h;
+        r.minute = (uint8_t)m;
+        r.days_mask = (uint8_t)mask;
+        r.pattern = pat;
+        r.intensity = inten;
+        r.once = (once != 0);
+        r.spent = false;
+        r.label[0] = '\0';
+
+        p += consumed;
+
+        // الحقل السابع (اسم التذكير) اختياري وآخر حقل بالمقطع، فيقدر يحتوي
+        // ':' بدون لبس — ';' وحده هو الفاصل بين المقاطع. اختياريّته مقصودة:
+        // جدول محفوظ بصيغة أقدم (بدون اسم) يظل يُقرأ بدل ما يُرفض كله.
+        if (*p == ':') {
+            p++;
+            size_t li = 0;
+            while (*p && *p != ';') {
+                if (li < sizeof(r.label) - 1) r.label[li++] = *p;
+                p++;
+            }
+            r.label[li] = '\0';
+            trim_incomplete_utf8(r.label);
+        }
+
+        Serial.printf("Reminders:   [%d] %02d:%02d mask=0x%02X نمط=%c شدة=%c مرة_وحدة=%d اسم=\"%s\"\n",
+                      count - 1, r.hour, r.minute, r.days_mask,
+                      r.pattern, r.intensity, r.once ? 1 : 0, r.label);
+
+        if (*p != ';') break;
+        p++;
+    }
+
+    // نص فاضي = طلب مسح صريح من التطبيق (آخر تذكير انحذف) — نحترمه.
+    // لكن نص فيه بيانات وما طلع منه ولا تذكير صالح = رسالة مشوّهة، فنتمسّك
+    // بالجدول القديم: مسحه يسكّت كل التذكيرات بدون ما يلاحظ أحد.
+    if (count == 0 && payload[0] != '\0') {
+        Serial.printf("Reminders: رسالة مشوّهة — نبقي الجدول الحالي (%d تذكير)\n",
+                      watch_reminder_count);
+        return -1;
+    }
+
+    memcpy(watch_reminders, parsed, sizeof(WatchReminder) * count);
+    watch_reminder_count = count;
+    return count;
+}
+
 static lv_obj_t *splash_screen;
 static lv_obj_t *onboarding_screen;
 static lv_obj_t *home_screen;
@@ -143,6 +313,7 @@ static volatile bool disconnect_requested = false;
 #define COLOR_DISCONNECTED lv_color_hex(0xE05A4E)
 
 static void build_settings_screen();
+static void dismiss_alert_cb(lv_event_t *e); // defined next to alert_return_timer, further down
 static void change_wifi_cb(lv_event_t *e); // defined near start_ble_provisioning(), further down
 static void cancel_wifi_setup_cb(lv_event_t *e); // defined alongside change_wifi_cb, further down
 
@@ -445,9 +616,26 @@ static void build_home_screen()
     lv_obj_set_style_text_color(batt_icon_label, COLOR_MUTED, 0);
 }
 
+// آخر قراءة للـRTC، تتحدّث مرة كل ثانية من مؤقّت الساعة تحت.
+//
+// أي كود ثاني يحتاج الوقت لازم يقرأ من هنا، ما يفتح قراءة I2C جديدة:
+// الـRTC على نفس ناقل الـI2C اللي عليه الـPMU ومحرك الاهتزاز DRV2605 (انظر
+// التعليق الطويل عند result_queue). قراءة الـRTC من داخل loop() مباشرة تعني
+// مئات المعاملات بالثانية على الناقل، وأول ما يشتغل تنبيه ويهتز المحرك
+// تتزاحم معه وتعلّق الناقل — وبعدها كل قراءات الـRTC ترجع قيمًا فاسدة،
+// فالساعة تصير ما تعرف كم الوقت وما يشتغل أي تذكير بعدها. مرة كل ثانية
+// (وهو المعدل اللي كان شغّالًا أصلًا وما سبّب مشاكل) آمن ووفير.
+struct RtcSnapshot {
+    int year, month, day, hour, minute;
+    bool valid;
+};
+static RtcSnapshot rtc_snapshot = {0, 0, 0, 0, 0, false};
+
 static void update_clock_display_cb(lv_timer_t *t)
 {
     RTC_DateTime now = instance.rtc.getDateTime();
+    rtc_snapshot = {now.getYear(),  now.getMonth(), now.getDay(),
+                    now.getHour(),  now.getMinute(), true};
 
     // This runs once a second (see the lv_timer_create call in setup) so the
     // displayed minute flips within a second of the real one. It used to run
@@ -533,16 +721,23 @@ static void build_alert_screen()
 {
     alert_screen = make_screen();
 
-    lv_obj_t *back_btn = lv_button_create(alert_screen);
-    lv_obj_set_style_bg_opa(back_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_shadow_width(back_btn, 0, 0);
-    lv_obj_set_style_pad_all(back_btn, 4, 0);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_RIGHT, 4, -4);
-    lv_obj_add_event_cb(back_btn, go_to_home_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_RIGHT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(back_icon, COLOR_TEXT, 0);
+    // زر إغلاق (X) بدل سهم الرجوع: التنبيه الآن يقعد على الشاشة دقيقة كاملة
+    // (انظر REMINDER_AUTO_RETURN_MS)، فلازم يكون واضح إن فيه طريقة تصرفه
+    // بنفسك. دائرة خفيفة خلف العلامة عشان يبان إنه زر يُضغط، مو مجرد رمز.
+    lv_obj_t *close_btn = lv_button_create(alert_screen);
+    lv_obj_set_size(close_btn, 40, 40);
+    lv_obj_set_style_radius(close_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(close_btn, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_width(close_btn, 0, 0);
+    lv_obj_set_style_pad_all(close_btn, 0, 0);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -6, 6);
+    lv_obj_add_event_cb(close_btn, dismiss_alert_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_icon = lv_label_create(close_btn);
+    lv_label_set_text(close_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(close_icon, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(close_icon, COLOR_TEXT, 0);
+    lv_obj_center(close_icon);
 
     alert_pulse_ring = lv_obj_create(alert_screen);
     lv_obj_remove_style_all(alert_pulse_ring);
@@ -591,16 +786,22 @@ static void build_sign_screen()
 {
     sign_screen = make_screen();
 
-    lv_obj_t *back_btn = lv_button_create(sign_screen);
-    lv_obj_set_style_bg_opa(back_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_shadow_width(back_btn, 0, 0);
-    lv_obj_set_style_pad_all(back_btn, 4, 0);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_RIGHT, 4, -4);
-    lv_obj_add_event_cb(back_btn, go_to_home_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_RIGHT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(back_icon, COLOR_TEXT, 0);
+    // نفس زر الإغلاق اللي بشاشة التنبيه العادية — الشاشتين تظهران لنفس
+    // السبب، فلازم تنصرفان بنفس الطريقة.
+    lv_obj_t *close_btn = lv_button_create(sign_screen);
+    lv_obj_set_size(close_btn, 40, 40);
+    lv_obj_set_style_radius(close_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(close_btn, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_width(close_btn, 0, 0);
+    lv_obj_set_style_pad_all(close_btn, 0, 0);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -6, 6);
+    lv_obj_add_event_cb(close_btn, dismiss_alert_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_icon = lv_label_create(close_btn);
+    lv_label_set_text(close_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(close_icon, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(close_icon, COLOR_TEXT, 0);
+    lv_obj_center(close_icon);
 
     lv_obj_t *frame = lv_obj_create(sign_screen);
     lv_obj_remove_flag(frame, LV_OBJ_FLAG_CLICKABLE);
@@ -637,7 +838,9 @@ static void show_sign_result(int category_index)
     lv_screen_load_anim(sign_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
 }
 
-static void show_alert(int category_index)
+// label_override: اسم التذكير لو فيه واحد. أي شي ثاني (تنبيهات تصنيف الصوت)
+// يمرّر nullptr فيُعرض اسم الفئة العام زي قبل.
+static void show_alert(int category_index, const char *label_override = nullptr)
 {
     const AlertCategory &cat = alert_categories[category_index];
     // Some categories (currently just "تذكير") have no sign-language video
@@ -654,7 +857,8 @@ static void show_alert(int category_index)
         build_alert_screen();
     }
     lv_image_set_src(alert_icon_img, cat.icon);
-    lv_label_set_text(alert_category_lbl, cat.label);
+    lv_label_set_text(alert_category_lbl,
+                      (label_override && label_override[0]) ? label_override : cat.label);
     lv_screen_load_anim(alert_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
     lv_anim_delete(alert_pulse_ring, alert_pulse_anim_cb);
     lv_anim_start(&alert_pulse_anim);
@@ -664,6 +868,22 @@ static void show_alert(int category_index)
 // sound doesn't sit on screen forever waiting for the user to back out.
 static lv_timer_t *alert_return_timer = NULL;
 #define ALERT_AUTO_RETURN_MS 6000
+// التذكير يقعد أطول بكثير من تنبيه صوت: تنبيه الصوت لحظي (جرس يرن الحين)،
+// أما التذكير فالمستخدم ممكن ما يكون شايف الساعة لحظة اهتزازها، ولو راحت
+// الشاشة بعد ٦ ثواني ما بيعرف وش كان التذكير أصلًا. زر الـX يصرفه قبلها.
+#define REMINDER_AUTO_RETURN_MS 60000
+
+// صرف التنبيه يدويًا من زر الـX. نلغي مؤقّت الرجوع التلقائي معه، وإلا ضل
+// شغّالًا وسحب المستخدم للرئيسية فجأة وهو بشاشة ثانية بعد ما صرف التنبيه.
+static void dismiss_alert_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    if (alert_return_timer) {
+        lv_timer_delete(alert_return_timer);
+        alert_return_timer = NULL;
+    }
+    lv_screen_load_anim(home_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+}
 
 static void alert_return_timeout_cb(lv_timer_t *t)
 {
@@ -686,16 +906,21 @@ struct ResultMessage {
     int category_index;
     char pattern;
     char intensity;
+    char label[64]; // نص يُعرض بدل اسم الفئة (اسم التذكير)؛ فاضي = اسم الفئة
 };
 static QueueHandle_t result_queue;
 
-static void show_result_category(int category_index)
+static void show_result_category(const ResultMessage &msg)
 {
-    show_alert(category_index);
+    const int category_index = msg.category_index;
+    show_alert(category_index, msg.label);
     if (alert_return_timer) {
         lv_timer_delete(alert_return_timer);
     }
-    alert_return_timer = lv_timer_create(alert_return_timeout_cb, ALERT_AUTO_RETURN_MS, NULL);
+    uint32_t hold_ms = (category_index == reminder_category_index())
+                           ? REMINDER_AUTO_RETURN_MS
+                           : ALERT_AUTO_RETURN_MS;
+    alert_return_timer = lv_timer_create(alert_return_timeout_cb, hold_ms, NULL);
     lv_timer_set_repeat_count(alert_return_timer, 1);
 }
 
@@ -728,18 +953,67 @@ static void trigger_vibration(char pattern, char intensity)
     instance.vibrator();
 }
 
+// اسم التذكير المطابق للدقيقة الحالية. لازم لأن تنبيه '#T' الجاي من الجوال
+// ثابت الطول (٤ بايت) وما يقدر يحمل اسمًا — فناخذ الاسم من الجدول المخزّن
+// عندنا. ±دقيقة عشان فرق بسيط بين ساعة الجوال وساعة الساعة ما يضيّع الاسم.
+static const char *lookup_reminder_label_for_now()
+{
+    const RtcSnapshot now = rtc_snapshot;
+    if (!now.valid || watch_reminder_count == 0) return nullptr;
+
+    const int now_min = now.hour * 60 + now.minute;
+    for (int i = 0; i < watch_reminder_count; i++) {
+        const WatchReminder &r = watch_reminders[i];
+        if (r.label[0] == '\0') continue;
+        int diff = now_min - (r.hour * 60 + r.minute);
+        if (diff < 0) diff = -diff;
+        if (diff > 1 && diff < 1439) continue; // 1439 = لفّة منتصف الليل
+        return r.label;
+    }
+    return nullptr;
+}
+
 // Called when a full '#'+category+pattern+intensity sequence arrives (real,
 // from the phone over Wi-Fi, on the network task; or simulated, typed into
 // Serial on the UI task for testing) — safe to call from either, since it
 // only ever queues a message rather than acting on it directly.
-static void handle_result_code(char code, char pattern, char intensity, const char *source)
+static void handle_result_code(char code, char pattern, char intensity, const char *source,
+                               const char *label = nullptr)
 {
+    // التذكير له مصدرين مقصودين (ساعة الساعة نفسها، والجوال لو كان صاحيًا) —
+    // نكتم الثاني عشان المستخدم ما يحس باهتزازين لنفس التذكير. يخص 'T' فقط:
+    // تنبيهات تصنيف الصوت ممكن تتكرر بشكل مشروع (طرق متتالي مثلًا).
+    if (code == 'T') {
+        unsigned long now_ms = millis();
+        if (last_reminder_dispatch_ms != 0 &&
+            now_ms - last_reminder_dispatch_ms < REMINDER_DUPLICATE_WINDOW_MS) {
+            Serial.printf("Result (%s): تذكير مكرر بعد %lu ثانية — تجاهل\n",
+                          source, (now_ms - last_reminder_dispatch_ms) / 1000);
+            return;
+        }
+        last_reminder_dispatch_ms = now_ms;
+    }
+
     for (size_t i = 0; i < RESULT_CODE_COUNT; i++) {
         if (result_codes[i].code != code) continue;
 
-        Serial.printf("Result (%s): '%c' -> %s (pattern=%c, intensity=%c)\n",
-                      source, code, alert_categories[result_codes[i].category_index].label, pattern, intensity);
-        ResultMessage msg = {result_codes[i].category_index, pattern, intensity};
+        ResultMessage msg = {result_codes[i].category_index, pattern, intensity, {0}};
+
+        // تنبيه تذكير جاي من الجوال ما يحمل اسمًا (بروتوكول '#' ثابت الطول)
+        // — ندوّر على التذكير المطابق للوقت الحالي بالجدول وناخذ اسمه منه.
+        const char *shown = label;
+        if (code == 'T' && (shown == nullptr || shown[0] == '\0')) {
+            shown = lookup_reminder_label_for_now();
+        }
+        if (shown && shown[0]) {
+            strncpy(msg.label, shown, sizeof(msg.label) - 1);
+            msg.label[sizeof(msg.label) - 1] = '\0';
+            trim_incomplete_utf8(msg.label);
+        }
+
+        Serial.printf("Result (%s): '%c' -> %s%s%s (pattern=%c, intensity=%c)\n",
+                      source, code, alert_categories[msg.category_index].label,
+                      msg.label[0] ? " — " : "", msg.label, pattern, intensity);
         xQueueSend(result_queue, &msg, 0);
         return;
     }
@@ -1416,6 +1690,64 @@ static void save_wifi_credentials(const char *ssid, const char *pass)
     wifi_prefs.putString("wifi_pass", pass);
     wifi_prefs.end();
 }
+
+// نحفظ نص الجدول كما وصل (مو المصفوفة المفكوكة): أبسط، ويخلي إعادة التحميل
+// بعد إعادة التشغيل تمر بنفس دالة الفك ونفس التحقق بالضبط.
+static void save_reminders_payload(const char *payload)
+{
+    wifi_prefs.begin("nabeeh", false);
+    wifi_prefs.putString("reminders", payload ? payload : "");
+    wifi_prefs.end();
+}
+
+static void load_reminders_from_prefs()
+{
+    wifi_prefs.begin("nabeeh", true); // read-only
+    String saved = wifi_prefs.getString("reminders", "");
+    wifi_prefs.end();
+    Serial.printf("Reminders: المحفوظ بالذاكرة = \"%s\"\n", saved.c_str());
+    int n = parse_reminder_payload(saved.c_str());
+    Serial.printf("Reminders: حُمّل %d تذكير من الذاكرة\n", n < 0 ? 0 : n);
+}
+
+// تفريغ الحالة كاملة بضغطة زر — '?' بالسيريال (أو من التطبيق). هذا هو المكان
+// الوحيد اللي يحتاجه أي سؤال عن "ليش التذكير ما اشتغل": وقت الساعة، اليوم
+// المحسوب، كل تذكير مخزّن بحالته، وآخر مرة انطلق فيها تذكير.
+static void dump_reminder_state(const char *source)
+{
+    const RtcSnapshot now = rtc_snapshot;
+    int today = now.valid ? weekday_iso(now.year, now.month, now.day) : 0;
+
+    wifi_prefs.begin("nabeeh", true);
+    String saved = wifi_prefs.getString("reminders", "");
+    wifi_prefs.end();
+
+    Serial.printf("\n===== حالة التذكيرات (%s) =====\n", source);
+    if (now.valid) {
+        Serial.printf("ساعة الجهاز : %04d-%02d-%02d %02d:%02d  (يوم الأسبوع %d، bit=0x%02X)\n",
+                      now.year, now.month, now.day, now.hour, now.minute,
+                      today, 1 << (today - 1));
+    } else {
+        Serial.println("ساعة الجهاز : لسا ما قُرئت (مؤقّت الساعة ما اشتغل بعد)");
+    }
+    Serial.printf("بالذاكرة    : \"%s\"\n", saved.c_str());
+    Serial.printf("بالرام      : %d تذكير\n", watch_reminder_count);
+    for (int i = 0; i < watch_reminder_count; i++) {
+        WatchReminder &r = watch_reminders[i];
+        Serial.printf("  [%d] %02d:%02d mask=0x%02X نمط=%c شدة=%c مرة_وحدة=%d اشتغل=%d اسم=\"%s\"\n",
+                      i, r.hour, r.minute, r.days_mask, r.pattern, r.intensity,
+                      r.once ? 1 : 0, r.spent ? 1 : 0, r.label);
+    }
+    if (last_reminder_dispatch_ms == 0) {
+        Serial.println("آخر تذكير  : ما انطلق أي تذكير منذ التشغيل");
+    } else {
+        Serial.printf("آخر تذكير  : قبل %lu ثانية (نافذة كتم التكرار %lu ثانية)\n",
+                      (millis() - last_reminder_dispatch_ms) / 1000,
+                      REMINDER_DUPLICATE_WINDOW_MS / 1000);
+    }
+    Serial.printf("اتصال الجوال: %s\n", phone_connected ? "متصل" : "غير متصل");
+    Serial.println("=================================\n");
+}
 static const uint16_t TCP_PORT = 3333;
 static const size_t CHUNK_SIZE = 1024; // 512 samples @ 16-bit = ~32ms of audio per chunk
 
@@ -1452,6 +1784,15 @@ static char pending_category = 0;
 static char pending_pattern = 0;
 static unsigned long result_parse_started = 0; // millis() when the '#' arrived, so a stray/interrupted sequence can't wedge the parser forever
 #define RESULT_CODE_WAIT_TIMEOUT_MS 1000
+
+// استقبال جدول التذكيرات: على عكس '#' (طوله ثابت ٤ بايت)، هذا الأمر نصّي
+// بطول متغيّر، فنجمع البايتات لين '\n'. ١٦ تذكير × ~٢٠ حرف = ~٣٢٠ بايت،
+// والمخزن ضعف هذا بهامش مريح.
+static bool reminder_rx_active = false;
+static char reminder_rx_buf[1600]; // ١٦ تذكير × (~٢٠ بايت أرقام + اسم لين ٤٧ بايت) + هامش
+static size_t reminder_rx_len = 0;
+static unsigned long reminder_rx_started = 0;
+#define REMINDER_RX_TIMEOUT_MS 3000
 #define WIFI_RECONNECT_TIMEOUT_MS 15000
 #define RECONNECT_BACKOFF_MAX_MS 30000
 static uint8_t audio_buf[CHUNK_SIZE];
@@ -1474,6 +1815,37 @@ static bool is_valid_result_code(char c)
 
 static void handle_incoming_byte(char c, const char *source)
 {
+    if (reminder_rx_active) {
+        if (millis() - reminder_rx_started > REMINDER_RX_TIMEOUT_MS) {
+            Serial.printf("Reminders (%s): انتهت مهلة الاستقبال — إلغاء\n", source);
+            reminder_rx_active = false;
+            // نكمل لتحت: البايت الحالي يُعامل كأمر عادي بدل ما يضيع.
+        } else if (c == '\n' || c == '\r') {
+            reminder_rx_buf[reminder_rx_len] = '\0';
+            reminder_rx_active = false;
+            Serial.printf("Reminders (%s): وصل \"%s\"\n", source, reminder_rx_buf);
+            int n = parse_reminder_payload(reminder_rx_buf);
+            if (n >= 0) {
+                save_reminders_payload(reminder_rx_buf); // ما نحفظ رسالة مرفوضة
+            } else {
+                n = watch_reminder_count; // الردّ يعكس الجدول الفعلي، مو الرسالة المرفوضة
+            }
+            Serial.printf("Reminders (%s): الجدول الآن فيه %d تذكير\n", source, n);
+            if (strcmp(source, "client") == 0 && client && client.connected()) {
+                char ack[16];
+                snprintf(ack, sizeof(ack), "R,%d\n", n);
+                client.print(ack);
+            }
+            return;
+        } else if (reminder_rx_len < sizeof(reminder_rx_buf) - 1) {
+            reminder_rx_buf[reminder_rx_len++] = c;
+            return;
+        } else {
+            Serial.printf("Reminders (%s): الجدول أطول من المخزن — إلغاء\n", source);
+            reminder_rx_active = false;
+        }
+    }
+
     if (result_parse_state != RESULT_IDLE) {
         bool timed_out = millis() - result_parse_started > RESULT_CODE_WAIT_TIMEOUT_MS;
         bool valid = (result_parse_state == RESULT_AWAIT_CATEGORY) ? is_valid_result_code(c) : (c == '1' || c == '2' || c == '3');
@@ -1527,6 +1899,24 @@ static void handle_incoming_byte(char c, const char *source)
         if (strcmp(source, "client") == 0 && client && client.connected()) {
             client.print(resp);
         }
+    } else if (c == '@') {
+        Serial.printf("Reminders (%s): بدأ استقبال جدول جديد\n", source);
+        reminder_rx_active = true;
+        reminder_rx_len = 0;
+        reminder_rx_started = millis();
+    } else if (c == '?') {
+        dump_reminder_state(source);
+    } else if (c == '!') {
+        // إطلاق تذكير تجريبي فورًا، بدون انتظار الساعة — يفصل "مسار التنبيه
+        // نفسه" عن "منطق مطابقة الوقت" وقت التشخيص. يتخطّى كتم التكرار عن
+        // قصد عشان تقدر تجربه مرات متتالية.
+        last_reminder_dispatch_ms = 0;
+        char pat = watch_reminder_count > 0 ? watch_reminders[0].pattern : '1';
+        char inten = watch_reminder_count > 0 ? watch_reminders[0].intensity : '1';
+        const char *lbl = watch_reminder_count > 0 ? watch_reminders[0].label : "";
+        Serial.printf("Reminders (%s): إطلاق تجريبي (نمط=%c شدة=%c اسم=\"%s\")\n",
+                      source, pat, inten, lbl);
+        handle_result_code('T', pat, inten, source, lbl);
     }
 }
 
@@ -1822,6 +2212,7 @@ static void network_task(void *pvParameters)
             streaming = false;
             connection_start_millis = millis();
             result_parse_state = RESULT_IDLE; // a previous connection can't leave half-read state behind
+            reminder_rx_active = false;       // ولا نصف جدول تذكيرات يبلع أول بايتات الاتصال الجديد
             Serial.println("Client connected.");
         } else if (!client || !client.connected()) {
             if (was_connected) {
@@ -1843,8 +2234,22 @@ static void network_task(void *pvParameters)
             last_client_seen_millis = millis();
         }
 
-        if (client && client.connected() && client.available()) {
-            handle_incoming_byte(client.read(), "client"); // e.g. the 'I' status/battery poll
+        // نستنزف كل البايتات المتاحة بكل دورة، مو بايت واحد فقط. سببين،
+        // وكلاهما ظهر فعليًا مع أمر جدول التذكيرات '@':
+        //  ١) هذي الحلقة تنتهي بـ vTaskDelay(2ms)، فبايت/دورة يعني ~٢ ملي
+        //     ثانية للبايت الواحد. أمر '#T11' طوله ٤ بايت فيمر بسهولة، لكن
+        //     جدول التذكيرات عشرات البايتات — والجوال يقفل الاتصال بعد ما
+        //     يرسل، فينقطع الجدول بالنص.
+        //  ٢) الشرط القديم كان يشترط connected()، و WiFiClient يعتبر
+        //     الاتصال منتهيًا لحظة وصول FIN حتى لو باقي بايتات مخزّنة عندنا
+        //     — فبقية الرسالة كانت تُرمى بدل ما تُقرأ. البايتات المخزّنة
+        //     صالحة تمامًا بعد الإغلاق، فنقرأها على أساس available() وحدها.
+        // الحد ٥١٢ عشان دفعة كبيرة ما تجوّع إرسال الصوت بنفس الحلقة.
+        if (client) {
+            int drained = 0;
+            while (client.available() && drained++ < 512) {
+                handle_incoming_byte(client.read(), "client");
+            }
         }
 
         // Real state lives here, not in the connect/disconnect branches above:
@@ -1875,6 +2280,55 @@ static void network_task(void *pvParameters)
     }
 }
 
+// يفحص الجدول مرة كل دقيقة مقابل ساعة الساعة نفسها. يُنادى من loop() (مهمة
+// الواجهة): handle_result_code ما يلمس الشاشة ولا محرك الاهتزاز بنفسه، بس
+// يحط رسالة بالطابور اللي يفرّغه loop() — نفس المسار اللي يمشي فيه أي تنبيه
+// جاي من الجوال، فما فيه أي تعامل خاص مع I2C هنا.
+static void check_watch_reminders()
+{
+    if (watch_reminder_count == 0) return;
+
+    // من اللقطة المشتركة، مو بقراءة I2C جديدة: هذي الدالة تُنادى من loop()
+    // يعني مئات المرات بالثانية. انظر التعليق عند RtcSnapshot.
+    const RtcSnapshot now = rtc_snapshot;
+    if (!now.valid) return;
+    // قبل أول مزامنة NTP ممكن يكون وقت الساعة غلط تمامًا (أو قيمة البذرة
+    // الأولية) — ما نطلق تذكيرًا على وقت ما نثق فيه.
+    if (now.year < 2025) return;
+
+    static int last_minute_checked = -1;
+    if (now.minute == last_minute_checked) return;
+    last_minute_checked = now.minute;
+
+    int today = weekday_iso(now.year, now.month, now.day); // ١..٧
+    uint8_t today_bit = (uint8_t)(1 << (today - 1));
+
+    // سطر واحد كل دقيقة وقت التشخيص: يخلي "ليش ما اشتغل التذكير؟" سؤالًا
+    // له جواب مكتوب بدل تخمين. أطفئه بـ REMINDER_DEBUG_LOG بعد ما يستقر.
+#if REMINDER_DEBUG_LOG
+    Serial.printf("Reminders: الوقت %02d:%02d يوم=%d (bit=0x%02X) — %d مخزّنة\n",
+                  now.hour, now.minute, today, today_bit, watch_reminder_count);
+#endif
+
+    for (int i = 0; i < watch_reminder_count; i++) {
+        WatchReminder &r = watch_reminders[i];
+        if (r.hour != now.hour || r.minute != now.minute) continue;
+        // من هنا: الوقت مطابق. أي سبب يمنع الإطلاق يُطبع صراحة، ما يُبلع بصمت.
+        if (r.spent) {
+            Serial.printf("Reminders: [%d] وقته الآن لكنه تذكير مرة-وحدة اشتغل سابقًا — تخطّي\n", i);
+            continue;
+        }
+        if (!(r.days_mask & today_bit)) {
+            Serial.printf("Reminders: [%d] وقته الآن لكن اليوم مو ضمن أيامه (mask=0x%02X، اليوم=0x%02X) — تخطّي\n",
+                          i, r.days_mask, today_bit);
+            continue;
+        }
+
+        if (r.once) r.spent = true; // بالذاكرة فقط: الجوال يرسل جدولًا محدّثًا بدون هذا التذكير على أي حال
+        handle_result_code('T', r.pattern, r.intensity, "watch-clock", r.label);
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -1900,6 +2354,7 @@ void setup()
     if (instance.rtc.getDateTime().getYear() < 2024) {
         instance.rtc.setDateTime(RTC_DateTime(2026, 8, 16, 9, 16, 15)); // Asia/Riyadh, UTC+3
     }
+    load_reminders_from_prefs();
     update_clock_display_cb(NULL);
     // 1s, not 30s: the clock label only shows HH:MM, so a 30s period let the
     // face lag up to half a minute behind the real minute rollover. The
@@ -1936,9 +2391,11 @@ void loop()
 
     ResultMessage msg;
     if (xQueueReceive(result_queue, &msg, 0) == pdTRUE) {
-        show_result_category(msg.category_index);
+        show_result_category(msg);
         trigger_vibration(msg.pattern, msg.intensity); // I2C on the same bus as RTC/PMU — UI task only, see result_queue's comment
     }
+
+    check_watch_reminders();
 
     if (Serial.available()) {
         handle_incoming_byte(Serial.read(), "Serial");
