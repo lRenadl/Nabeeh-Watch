@@ -56,6 +56,7 @@
 #include <LilyGoLib.h>
 #include <LV_Helper.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <time.h>
@@ -1271,6 +1272,7 @@ static bool portal_active = false;
 // writes, other task polls" pattern as wifi_credentials_pending elsewhere
 // in this file, just for UI feedback instead of a credential hand-off.
 static volatile bool portal_ready_for_ui = false;
+static volatile bool wifi_setup_dismissed = false;
 // Set by the toast's close (X) button (UI task); network_task tears down
 // whichever provisioning method is actually running (or about to start)
 // and resets portal_ready_for_ui, same hand-off pattern as everything else
@@ -1556,6 +1558,7 @@ static void handle_portal_save()
 static void start_wifi_ap_provisioning()
 {
     if (portal_active) return;
+    wifi_setup_dismissed = false;
     // AP_STA, not just AP: scanning for nearby networks (for the dropdown)
     // needs the station radio active too, alongside the AP the phone
     // connects to.
@@ -1635,6 +1638,7 @@ static void cancel_wifi_setup_cb(lv_event_t *e)
     if (wifi_status_box) {
         lv_obj_add_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
     }
+    wifi_setup_dismissed = true;
     cancel_wifi_setup_requested = true;
 }
 
@@ -1646,12 +1650,12 @@ static void update_wifi_status_display_cb(lv_timer_t *t)
     static bool was_ready = false;
     if (!wifi_status_box) return; // Settings screen not built yet — nothing to update
 
-    if (portal_ready_for_ui && !was_ready) {
+    if (portal_ready_for_ui && !wifi_setup_dismissed && !was_ready) {
         char buf[64];
         snprintf(buf, sizeof(buf), "اتصل من جوالك بشبكة:\n%s", WIFI_AP_SSID);
         lv_label_set_text(wifi_status_label, buf); // same COLOR_PRIMARY box change_wifi_cb() already showed — only the text changes, no color swap
         lv_obj_remove_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
-    } else if (!portal_ready_for_ui && was_ready) {
+    } else if ((!portal_ready_for_ui || wifi_setup_dismissed) && was_ready) {
         lv_label_set_text(wifi_status_label, "");
         lv_obj_add_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1749,10 +1753,27 @@ static void dump_reminder_state(const char *source)
     Serial.println("=================================\n");
 }
 static const uint16_t TCP_PORT = 3333;
+static const char *MDNS_HOSTNAME = "nabeeh-watch";
 static const size_t CHUNK_SIZE = 1024; // 512 samples @ 16-bit = ~32ms of audio per chunk
 
 WiFiServer server(TCP_PORT);
 WiFiClient client;
+static bool mdns_started = false;
+
+static void ensure_mdns_service()
+{
+    if (WiFi.status() != WL_CONNECTED || mdns_started) return;
+
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+        MDNS.addService("nabeeh", "tcp", TCP_PORT);
+        mdns_started = true;
+        Serial.printf("mDNS service ready: %s.local (_nabeeh._tcp, port %u)\n",
+                      MDNS_HOSTNAME, TCP_PORT);
+    } else {
+        Serial.println("mDNS startup failed; phone discovery is unavailable.");
+    }
+}
+
 static bool was_connected = false;
 // The phone app doesn't hold one socket open the whole time it's "connected"
 // — it connects briefly to send an 'I' status/battery poll, gets its reply,
@@ -1796,6 +1817,34 @@ static unsigned long reminder_rx_started = 0;
 #define WIFI_RECONNECT_TIMEOUT_MS 15000
 #define RECONNECT_BACKOFF_MAX_MS 30000
 static uint8_t audio_buf[CHUNK_SIZE];
+static unsigned long audio_chunks_sent = 0;
+static unsigned long audio_bytes_sent = 0;
+static bool audio_read_started = false;
+static bool microphone_active = true; // instance.begin() initializes it during setup()
+
+static bool start_microphone()
+{
+    if (microphone_active) return true;
+
+    instance.mic.setPinsPdmRx(MIC_SCK, MIC_DAT);
+    microphone_active = instance.mic.begin(
+        I2S_MODE_PDM_RX,
+        16000,
+        I2S_DATA_BIT_WIDTH_16BIT,
+        I2S_SLOT_MODE_MONO,
+        I2S_STD_SLOT_LEFT);
+    Serial.printf("microphone started: %s (PCM16 mono 16000Hz)\n",
+                  microphone_active ? "yes" : "no");
+    return microphone_active;
+}
+
+static void stop_microphone()
+{
+    if (!microphone_active) return;
+    instance.mic.end();
+    microphone_active = false;
+    Serial.println("microphone stopped");
+}
 
 // "last sync" = how long the *current* connection has been up (counts up
 // while connected); once disconnected, it switches to how long ago that
@@ -1878,12 +1927,35 @@ static void handle_incoming_byte(char c, const char *source)
         result_parse_state = RESULT_AWAIT_CATEGORY;
         result_parse_started = millis();
     } else if (c == 'r' || c == 'R') {
+        if (!client || !client.connected()) {
+            Serial.printf("Streaming request (%s) ignored: TCP client is not connected.\n", source);
+            streaming = false;
+            return;
+        }
+        if (streaming) {
+            Serial.printf("command received: %c (ignored; streaming already active)\n", c);
+            return;
+        }
+        Serial.printf("command received: %c\n", c);
+        if (!start_microphone()) {
+            Serial.println("streaming not started: microphone initialization failed");
+            streaming = false;
+            return;
+        }
         streaming = true;
-        Serial.printf("Streaming started (%s).\n", source);
+        audio_chunks_sent = 0;
+        audio_bytes_sent = 0;
+        audio_read_started = false;
+        Serial.printf("Streaming started (%s): mic=PCM16 mono 16000Hz, TCP port=%u.\n",
+                      source, TCP_PORT);
     } else if (c == 's' || c == 'S') {
+        Serial.printf("command received: %c\n", c);
         streaming = false;
-        Serial.printf("Streaming stopped (%s).\n", source);
+        stop_microphone();
+        Serial.printf("Streaming stopped (%s): sent %lu chunks / %lu bytes; TCP server remains active.\n",
+                      source, audio_chunks_sent, audio_bytes_sent);
     } else if (c == 'i' || c == 'I') {
+        Serial.printf("command received: %c\n", c);
         int battery = instance.pmu.getBatteryPercent(); // -1 if unavailable (e.g. no battery connected)
         unsigned long sync_ago_sec;
         if (client && client.connected()) {
@@ -2053,6 +2125,7 @@ static void network_task(void *pvParameters)
         Serial.println("Wi-Fi connected.");
         Serial.print("Watch IP address: ");
         Serial.println(WiFi.localIP());
+        ensure_mdns_service();
         sync_rtc_from_ntp();
     } else {
         Serial.println("Wi-Fi not connected yet — BLE provisioning is disabled, will keep retrying in the background.");
@@ -2109,6 +2182,17 @@ static void network_task(void *pvParameters)
         // declared before this loop — both share the same guard so a fresh
         // sync always follows any moment Wi-Fi goes from down to up.
         bool is_connected_now = (WiFi.status() == WL_CONNECTED);
+        if (!is_connected_now && was_connected_last_loop && mdns_started) {
+            MDNS.end();
+            mdns_started = false;
+            Serial.println("mDNS stopped because Wi-Fi disconnected.");
+        }
+        if (!is_connected_now && was_connected_last_loop && WIFI_AP_PROVISIONING_ENABLED && !portal_active && !ble_active) {
+            Serial.println("Wi-Fi lost after a successful connection; starting setup network.");
+            start_wifi_ap_provisioning();
+        } else if (is_connected_now) {
+            ensure_mdns_service();
+        }
         if (is_connected_now && (!was_connected_last_loop || millis() - last_ntp_sync_millis >= NTP_RESYNC_INTERVAL_MS)) {
             if (sync_rtc_from_ntp()) {
                 last_ntp_sync_millis = millis();
@@ -2122,6 +2206,7 @@ static void network_task(void *pvParameters)
                 Serial.println("Reprovisioned Wi-Fi connected.");
                 Serial.print("Watch IP address: ");
                 Serial.println(WiFi.localIP());
+                ensure_mdns_service();
                 sync_rtc_from_ntp();
                 last_ntp_sync_millis = millis();
                 was_connected_last_loop = true; // already synced above — don't have the loop's own check redo it immediately
@@ -2201,24 +2286,30 @@ static void network_task(void *pvParameters)
         // watch at a time), so it always wins immediately.
         WiFiClient newClient = server.available();
         if (newClient) {
-            if (client && client.connected()) {
-                Serial.println("New client connecting — dropping previous (stale) connection.");
-                client.stop();
+            if (streaming && client && client.connected()) {
+                Serial.println("New client rejected: audio stream already owns the TCP connection.");
+                newClient.stop();
+            } else {
+                if (client && client.connected()) {
+                    Serial.println("New client connecting — dropping previous (stale) connection.");
+                    client.stop();
+                }
+                client = newClient;
+                client.setNoDelay(true); // send audio chunks immediately, don't batch
+                was_connected = true;
+                last_client_seen_millis = millis();
+                streaming = false;
+                connection_start_millis = millis();
+                result_parse_state = RESULT_IDLE; // a previous connection can't leave half-read state behind
+                reminder_rx_active = false;       // ولا نصف جدول تذكيرات يبلع أول بايتات الاتصال الجديد
+                Serial.println("Client connected.");
             }
-            client = newClient;
-            client.setNoDelay(true); // send audio chunks immediately, don't batch
-            was_connected = true;
-            last_client_seen_millis = millis();
-            streaming = false;
-            connection_start_millis = millis();
-            result_parse_state = RESULT_IDLE; // a previous connection can't leave half-read state behind
-            reminder_rx_active = false;       // ولا نصف جدول تذكيرات يبلع أول بايتات الاتصال الجديد
-            Serial.println("Client connected.");
         } else if (!client || !client.connected()) {
             if (was_connected) {
                 Serial.println("Client disconnected.");
                 was_connected = false;
                 streaming = false;
+                stop_microphone();
                 last_disconnect_millis = millis();
                 ever_connected = true;
             }
@@ -2271,9 +2362,34 @@ static void network_task(void *pvParameters)
         // dropped every chunk, unconditionally. Not doing that again.)
         if (streaming && client && client.connected()) {
             size_t n = instance.mic.readBytes((char *)audio_buf, CHUNK_SIZE);
-            if (n > 0) {
-                client.write(audio_buf, n);
+            if (!audio_read_started) {
+                audio_read_started = true;
+                Serial.printf("Microphone read started: requested=%u bytes, received=%u bytes.\n",
+                              (unsigned)CHUNK_SIZE, (unsigned)n);
             }
+            if (n > 0) {
+                size_t written = client.write(audio_buf, n);
+                audio_chunks_sent++;
+                audio_bytes_sent += written;
+                if (audio_chunks_sent == 1 || audio_chunks_sent % 100 == 0) {
+                    Serial.printf("Audio packet %lu: mic=%u bytes, tcp_written=%u, total=%lu.\n",
+                                  audio_chunks_sent, (unsigned)n, (unsigned)written,
+                                  audio_bytes_sent);
+                }
+                if (audio_chunks_sent == 1 && written == n) {
+                    Serial.println("first audio packet sent");
+                }
+                if (written != n) {
+                    Serial.printf("Audio short write: expected=%u, written=%u, connected=%s.\n",
+                                  (unsigned)n, (unsigned)written,
+                                  client.connected() ? "yes" : "no");
+                }
+            } else {
+                Serial.println("Microphone returned 0 bytes while streaming.");
+            }
+        } else if (streaming && (!client || !client.connected())) {
+            Serial.println("Streaming stopped: TCP client disconnected.");
+            streaming = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(2));
