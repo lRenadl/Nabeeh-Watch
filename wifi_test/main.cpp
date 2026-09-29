@@ -7,6 +7,21 @@
  * resampling is needed. ~32 KB/s, trivial for local Wi-Fi TCP.
  *
  * Wire protocol (one TCP connection, port 3333, full-duplex):
+ *   Connection handshake — required before ANY command below is accepted:
+ *   Pairing (only while unpaired: first boot, or after "إلغاء ارتباط الهاتف"):
+ *     watch -> phone : "PAIR,<64 hex>\n"  watch's ephemeral X25519 public key
+ *     phone -> watch : "PAIR,<64 hex>\n"  phone's ephemeral X25519 public key
+ *                      both derive key = SHA-256("nabeeh-pair-v1" || X25519
+ *                      shared secret || watch pub || phone pub) — the key
+ *                      itself never goes over the network. Then the normal
+ *                      AUTH exchange below proves both got the same key, and
+ *                      the watch only saves it once that succeeds.
+ *   Every connection (and right after pairing):
+ *     watch -> phone : "AUTH,<32 hex>\n"  16-byte random nonce
+ *     phone -> watch : "AUTH,<64 hex>\n"  HMAC-SHA256(device key, nonce bytes)
+ *     watch -> phone : "AUTH,OK\n" on success, or "AUTH,FAIL\n" then close on
+ *                      a wrong key. Malformed/late (>5s) responses are just
+ *                      closed — only AUTH,FAIL means the saved key is bad.
  *   watch -> phone : raw PCM audio bytes, continuously, while streaming
  *   phone -> watch : single control bytes
  *     'r' / 'R'  -> start streaming mic audio               (unchanged)
@@ -59,6 +74,11 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <esp_random.h>
+#include <mbedtls/md.h>     // HMAC-SHA256 for TCP connection authentication — see compute_hmac_sha256()
+#include <mbedtls/ecdh.h>   // X25519 key agreement for pairing — see pairing_begin()/pairing_finish()
+#include <mbedtls/sha256.h>
+#include <lwip/sockets.h>   // select() — non-blocking audio send, see socket_writable_now()
 #include <time.h>
 #include <sys/time.h> // settimeofday() — used to invalidate the RTC-seeded system clock before an NTP sync
 #include <string.h>
@@ -194,6 +214,271 @@ static void trim_incomplete_utf8(char *str)
     if ((i - 1) + need > len) str[i - 1] = '\0'; // الحرف الأخير ناقص
 }
 
+// ── شبكات واي فاي محفوظة ───────────────────────────────────────────────────
+// الساعة تحفظ عدة شبكات (مو وحدة بس زي قبل) عشان المستخدم يقدر يتنقل بينها
+// من شاشة إعدادات الواي فاي بدون ما يعيد كتابة كلمة المرور كل مرة. saved_networks[0]
+// دايمًا آخر شبكة اتصلت/اتضافت (الأحدث أول) — هذا الترتيب هو اللي load_wifi_credentials
+// تعتمد عليه عند الإقلاع (تجرب آخر شبكة نجحت)، ونفس الدالة add_or_update_saved_network
+// تستخدمها كل من: إعداد شبكة جديدة عبر BLE/نقطة الوصول، والضغط على شبكة محفوظة
+// من القائمة للاتصال بها — كلاهما "يستخدم" الشبكة فتصير الأحدث تلقائيًا.
+//
+// wifi_prefs مُعرّفة هنا (مو بقسم الواي فاي/الشبكة تحت) عشان هذي الدوال تحتاجها
+// وتُستدعى من شاشات الواجهة المبنية قبل ذاك القسم بالملف.
+static Preferences wifi_prefs;
+#define MAX_SAVED_NETWORKS 5
+struct SavedNetwork {
+    char ssid[64];
+    char pass[64];
+};
+static SavedNetwork saved_networks[MAX_SAVED_NETWORKS];
+static int saved_network_count = 0;
+
+// يحمّل القائمة من NVS. لو ما فيه قائمة محفوظة بعد (تحديث من نسخة أقدم كانت
+// تخزن شبكة وحدة بمفاتيح "wifi_ssid"/"wifi_pass")، يهاجر تلك الشبكة كأول
+// عنصر بالقائمة الجديدة بدل ما يفقدها.
+static void load_saved_networks()
+{
+    wifi_prefs.begin("nabeeh", true);
+    saved_network_count = wifi_prefs.getUChar("net_count", 0);
+    if (saved_network_count > MAX_SAVED_NETWORKS) saved_network_count = MAX_SAVED_NETWORKS;
+    for (int i = 0; i < saved_network_count; i++) {
+        char key_s[12], key_p[12];
+        snprintf(key_s, sizeof(key_s), "net%d_s", i);
+        snprintf(key_p, sizeof(key_p), "net%d_p", i);
+        String s = wifi_prefs.getString(key_s, "");
+        String p = wifi_prefs.getString(key_p, "");
+        strncpy(saved_networks[i].ssid, s.c_str(), sizeof(saved_networks[i].ssid) - 1);
+        saved_networks[i].ssid[sizeof(saved_networks[i].ssid) - 1] = '\0';
+        strncpy(saved_networks[i].pass, p.c_str(), sizeof(saved_networks[i].pass) - 1);
+        saved_networks[i].pass[sizeof(saved_networks[i].pass) - 1] = '\0';
+    }
+    String legacy_ssid = wifi_prefs.getString("wifi_ssid", "");
+    String legacy_pass = wifi_prefs.getString("wifi_pass", "");
+    wifi_prefs.end();
+
+    if (saved_network_count == 0 && legacy_ssid.length() > 0) {
+        strncpy(saved_networks[0].ssid, legacy_ssid.c_str(), sizeof(saved_networks[0].ssid) - 1);
+        saved_networks[0].ssid[sizeof(saved_networks[0].ssid) - 1] = '\0';
+        strncpy(saved_networks[0].pass, legacy_pass.c_str(), sizeof(saved_networks[0].pass) - 1);
+        saved_networks[0].pass[sizeof(saved_networks[0].pass) - 1] = '\0';
+        saved_network_count = 1;
+        // نحفظها فورًا بالصيغة الجديدة عشان الهجرة تصير مرة وحدة بس، مو كل إقلاع.
+        wifi_prefs.begin("nabeeh", false);
+        wifi_prefs.putUChar("net_count", 1);
+        wifi_prefs.putString("net0_s", saved_networks[0].ssid);
+        wifi_prefs.putString("net0_p", saved_networks[0].pass);
+        wifi_prefs.end();
+    }
+}
+
+static void save_saved_networks()
+{
+    wifi_prefs.begin("nabeeh", false);
+    wifi_prefs.putUChar("net_count", (uint8_t)saved_network_count);
+    for (int i = 0; i < saved_network_count; i++) {
+        char key_s[12], key_p[12];
+        snprintf(key_s, sizeof(key_s), "net%d_s", i);
+        snprintf(key_p, sizeof(key_p), "net%d_p", i);
+        wifi_prefs.putString(key_s, saved_networks[i].ssid);
+        wifi_prefs.putString(key_p, saved_networks[i].pass);
+    }
+    wifi_prefs.end();
+}
+
+// يضيف شبكة جديدة أو يحدّث كلمة مرور شبكة موجودة، ويخليها بالمقدمة (index 0)
+// دايمًا — هذا هو ترتيب "الأحدث استخدامًا أول". لو القائمة مليانة وهذي شبكة
+// جديدة فعلاً، أقدم شبكة (آخر عنصر) تنحذف عشان تفسح لها مكان.
+static void add_or_update_saved_network(const char *ssid, const char *pass)
+{
+    int existing = -1;
+    for (int i = 0; i < saved_network_count; i++) {
+        if (strcmp(saved_networks[i].ssid, ssid) == 0) {
+            existing = i;
+            break;
+        }
+    }
+    int shift_from = (existing >= 0) ? existing : ((saved_network_count >= MAX_SAVED_NETWORKS) ? MAX_SAVED_NETWORKS - 1 : saved_network_count);
+    for (int i = shift_from; i > 0; i--) {
+        saved_networks[i] = saved_networks[i - 1];
+    }
+    strncpy(saved_networks[0].ssid, ssid, sizeof(saved_networks[0].ssid) - 1);
+    saved_networks[0].ssid[sizeof(saved_networks[0].ssid) - 1] = '\0';
+    strncpy(saved_networks[0].pass, pass, sizeof(saved_networks[0].pass) - 1);
+    saved_networks[0].pass[sizeof(saved_networks[0].pass) - 1] = '\0';
+    if (existing < 0 && saved_network_count < MAX_SAVED_NETWORKS) saved_network_count++;
+    save_saved_networks();
+    Serial.printf("DBG saved_networks after add/update '%s': count=%d ->", ssid, saved_network_count);
+    for (int i = 0; i < saved_network_count; i++) Serial.printf(" [%d]=%s", i, saved_networks[i].ssid);
+    Serial.println();
+}
+
+// يمسح كل الشبكات المحفوظة (زر "مسح الكل" بشاشة إعدادات الواي فاي). يمسح
+// مفاتيح الصيغة القديمة كمان عشان الهجرة بـload_saved_networks ما ترجّعها.
+static void clear_saved_networks()
+{
+    wifi_prefs.begin("nabeeh", false);
+    wifi_prefs.putUChar("net_count", 0);
+    wifi_prefs.remove("wifi_ssid");
+    wifi_prefs.remove("wifi_pass");
+    wifi_prefs.end();
+    saved_network_count = 0;
+}
+
+// ── مصادقة اتصال TCP بمفتاح فريد لكل جهاز (HMAC-SHA256) ────────────────────
+// المفتاح ما ينتقل على الشبكة أبدًا: وقت الإقران (device_paired == false) الساعة
+// والجوال يسوون تبادل مفاتيح X25519 (ECDH) — كل طرف يرسل مفتاحه العام المؤقت
+// بس، ويحسب منه نفس السر المشترك، واللي يراقب الشبكة ما يقدر يوصل له. المفتاح
+// النهائي = SHA-256("nabeeh-pair-v1" || السر || عام الساعة || عام الجوال).
+// ما ينحفظ إلا بعد ما يثبت الجوال إنه وصل لنفس المفتاح (رد AUTH صحيح)، فإقران
+// ناقص ما يستهلك نافذة الإقران. بعدها كل اتصال يثبت معرفته بالمفتاح عبر تحدٍّ
+// (nonce) — انظر network_task. "إلغاء ارتباط الهاتف" بشاشة الإعدادات
+// يلغي المفتاح الحالي ويفتح نافذة إقران جديدة (تغيير الجوال أو فقدان المفتاح).
+// حد معروف: مهاجم نشط يعترض الاتصال بلحظة الإقران نفسها (MITM) يقدر يخدع
+// الطرفين؛ التنصت وحده ما يكفيه.
+#define DEVICE_KEY_LEN 32
+static uint8_t device_key[DEVICE_KEY_LEN];
+static bool device_paired = false;
+
+// Ephemeral X25519 state for the one pairing handshake in progress (if any).
+static mbedtls_ecp_group pair_grp;
+static mbedtls_mpi pair_priv;
+
+static int hw_rng(void *, unsigned char *buf, size_t len)
+{
+    esp_fill_random(buf, len);
+    return 0;
+}
+
+static bool pairing_begin(uint8_t watch_pub_out[32])
+{
+    mbedtls_ecp_group_free(&pair_grp);
+    mbedtls_mpi_free(&pair_priv);
+    mbedtls_ecp_group_init(&pair_grp);
+    mbedtls_mpi_init(&pair_priv);
+    mbedtls_ecp_point pub;
+    mbedtls_ecp_point_init(&pub);
+    size_t olen = 0;
+    bool ok = mbedtls_ecp_group_load(&pair_grp, MBEDTLS_ECP_DP_CURVE25519) == 0 &&
+              mbedtls_ecdh_gen_public(&pair_grp, &pair_priv, &pub, hw_rng, NULL) == 0 &&
+              mbedtls_ecp_point_write_binary(&pair_grp, &pub, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                             &olen, watch_pub_out, 32) == 0 &&
+              olen == 32;
+    mbedtls_ecp_point_free(&pub);
+    return ok;
+}
+
+// Fails on a malformed or low-order phone key (mbedtls rejects an all-zero
+// shared secret). The ephemeral private key is wiped either way.
+static bool pairing_finish(const uint8_t watch_pub[32], const uint8_t phone_pub[32], uint8_t key_out[32])
+{
+    mbedtls_ecp_point peer;
+    mbedtls_mpi z;
+    mbedtls_ecp_point_init(&peer);
+    mbedtls_mpi_init(&z);
+    uint8_t shared[32];
+    bool ok = mbedtls_ecp_point_read_binary(&pair_grp, &peer, phone_pub, 32) == 0 &&
+              mbedtls_ecdh_compute_shared(&pair_grp, &z, &peer, &pair_priv, hw_rng, NULL) == 0 &&
+              mbedtls_mpi_write_binary_le(&z, shared, 32) == 0;
+    if (ok) {
+        static const char label[] = "nabeeh-pair-v1";
+        const size_t label_len = sizeof(label) - 1;
+        uint8_t buf[sizeof(label) - 1 + 32 * 3];
+        memcpy(buf, label, label_len);
+        memcpy(buf + label_len, shared, 32);
+        memcpy(buf + label_len + 32, watch_pub, 32);
+        memcpy(buf + label_len + 64, phone_pub, 32);
+        ok = mbedtls_sha256(buf, sizeof(buf), key_out, 0) == 0;
+        memset(buf, 0, sizeof(buf));
+    }
+    memset(shared, 0, sizeof(shared));
+    mbedtls_ecp_point_free(&peer);
+    mbedtls_mpi_free(&z);
+    mbedtls_mpi_free(&pair_priv);
+    mbedtls_mpi_init(&pair_priv);
+    return ok;
+}
+
+static void compute_hmac_sha256(const uint8_t *key, size_t key_len,
+                                 const uint8_t *msg, size_t msg_len,
+                                 uint8_t *out32)
+{
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, info, 1 /* HMAC */);
+    mbedtls_md_hmac_starts(&ctx, key, key_len);
+    mbedtls_md_hmac_update(&ctx, msg, msg_len);
+    mbedtls_md_hmac_finish(&ctx, out32);
+    mbedtls_md_free(&ctx);
+}
+
+static void bytes_to_hex(const uint8_t *data, size_t len, char *out_hex /* len*2+1 bytes */)
+{
+    static const char *digits = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out_hex[i * 2]     = digits[data[i] >> 4];
+        out_hex[i * 2 + 1] = digits[data[i] & 0x0F];
+    }
+    out_hex[len * 2] = '\0';
+}
+
+static bool hex_to_bytes(const char *hex, size_t hex_len, uint8_t *out, size_t out_len)
+{
+    if (hex_len != out_len * 2) return false;
+    for (size_t i = 0; i < out_len; i++) {
+        char c1 = hex[i * 2], c2 = hex[i * 2 + 1];
+        int hi = isdigit((unsigned char)c1) ? c1 - '0' : (tolower(c1) - 'a' + 10);
+        int lo = isdigit((unsigned char)c2) ? c2 - '0' : (tolower(c2) - 'a' + 10);
+        if (hi < 0 || hi > 15 || lo < 0 || lo > 15) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void save_paired_key(const uint8_t key[DEVICE_KEY_LEN])
+{
+    memcpy(device_key, key, DEVICE_KEY_LEN);
+    device_paired = true;
+    wifi_prefs.begin("nabeeh", false);
+    wifi_prefs.putBytes("dev_key", device_key, DEVICE_KEY_LEN);
+    wifi_prefs.putBool("paired", true);
+    wifi_prefs.end();
+}
+
+// يلغي المفتاح الحالي (يستبدله بقيمة عشوائية ما يعرفها أحد، فالجوال القديم
+// ينرفض فورًا) ويفتح نافذة إقران جديدة — أول إقلاع وزر "إلغاء ارتباط الهاتف".
+static void forget_pairing()
+{
+    esp_fill_random(device_key, DEVICE_KEY_LEN);
+    device_paired = false;
+    wifi_prefs.begin("nabeeh", false);
+    wifi_prefs.putBytes("dev_key", device_key, DEVICE_KEY_LEN);
+    wifi_prefs.putBool("paired", false);
+    wifi_prefs.remove("key_delivered"); // leftover from the plaintext-PAIR build
+    wifi_prefs.end();
+    Serial.println("Security: pairing cleared — the next phone to connect will pair via X25519.");
+}
+
+// يُستدعى مرة وحدة عند الإقلاع (network_task).
+static void ensure_device_key()
+{
+    mbedtls_ecp_group_init(&pair_grp);
+    mbedtls_mpi_init(&pair_priv);
+
+    wifi_prefs.begin("nabeeh", true);
+    size_t got = wifi_prefs.getBytesLength("dev_key");
+    bool paired = wifi_prefs.getBool("paired", false);
+    if (got == DEVICE_KEY_LEN) {
+        wifi_prefs.getBytes("dev_key", device_key, DEVICE_KEY_LEN);
+        device_paired = paired;
+        wifi_prefs.end();
+        Serial.printf("Security: %s.\n", device_paired ? "paired" : "not paired yet — waiting for a phone to pair");
+        return;
+    }
+    wifi_prefs.end();
+    forget_pairing();
+}
+
 // يرجّع يوم الأسبوع ١=الاثنين .. ٧=الأحد (خوارزمية Sakamoto). نحسبه من
 // التاريخ بأنفسنا بدل ما نقرأ حقل يوم الأسبوع من الـRTC، لأن ذاك الحقل سجل
 // منفصل بالشريحة ولا يتحدّث تلقائيًا لما نضبط الوقت من NTP.
@@ -285,6 +570,14 @@ static lv_obj_t *splash_screen;
 static lv_obj_t *onboarding_screen;
 static lv_obj_t *home_screen;
 static lv_obj_t *settings_screen = NULL;
+static lv_obj_t *wifi_settings_screen = NULL;
+static lv_obj_t *wifi_current_network_lbl = NULL;
+static lv_obj_t *wifi_saved_list = NULL;         // scrollable column of saved-network rows, rebuilt by refresh_wifi_saved_list()
+static lv_obj_t *wifi_reset_confirm_overlay = NULL;
+// Set by the Settings screen's "إلغاء ارتباط الهاتف" confirm (UI task);
+// network_task calls forget_pairing() and drops the current TCP client, since
+// it owns that socket.
+static volatile bool security_reset_requested = false;
 static lv_obj_t *alert_screen = NULL;
 static lv_obj_t *clock_label;
 static lv_obj_t *date_label;
@@ -304,11 +597,27 @@ static bool sign_language_mode = true; // matches the pre-selected option in onb
 // only polls it (see update_connection_status_poll_cb, a timer in setup())
 // — same cross-task ownership pattern as portal_ready_for_ui.
 static volatile bool phone_connected = false;
-// Set by the Settings screen's disconnect button (UI task); network_task
-// consumes it and actually closes the socket, instead of the button
-// previously just flipping a cosmetic flag with no effect on the real
-// connection.
-static volatile bool disconnect_requested = false;
+// Set by the Wi-Fi settings screen's "مسح كل الشبكات المحفوظة" confirm
+// (UI task, clears saved_networks[] itself immediately since NVS access
+// isn't task-restricted in this file); network_task consumes this flag to
+// actually drop the radio connection and stop retrying the just-cleared
+// credentials.
+static volatile bool wifi_reset_requested = false;
+
+// Wi-Fi settings screen: "only show saved networks that are actually in
+// range right now" — network_task (the task that owns all WiFi.* calls in
+// this file) runs the scan and drops the raw SSID list here; the UI task
+// only ever reads nearby_ssids[]/nearby_ssid_count after wifi_scan_ready
+// flips true, so there's no concurrent read/write on them despite crossing
+// tasks. Scanning while connected briefly interrupts the radio (the ESP32
+// hops channels to scan), so this only ever runs when the user explicitly
+// opens the Wi-Fi settings screen — never in the background — to keep that
+// cost rare and expected rather than a surprise mid-stream.
+static volatile bool wifi_scan_for_settings_requested = false;
+static volatile bool wifi_scan_for_settings_ready = false;
+#define MAX_SCAN_RESULTS 32
+static String nearby_ssids[MAX_SCAN_RESULTS];
+static int nearby_ssid_count = 0;
 
 #define COLOR_CONNECTED    lv_color_hex(0x35D07F)
 #define COLOR_DISCONNECTED lv_color_hex(0xE05A4E)
@@ -317,6 +626,11 @@ static void build_settings_screen();
 static void dismiss_alert_cb(lv_event_t *e); // defined next to alert_return_timer, further down
 static void change_wifi_cb(lv_event_t *e); // defined near start_ble_provisioning(), further down
 static void cancel_wifi_setup_cb(lv_event_t *e); // defined alongside change_wifi_cb, further down
+static void build_wifi_settings_screen(); // defined next to go_to_wifi_settings_cb(), further down
+static void refresh_wifi_saved_list(); // defined next to build_wifi_settings_screen(), further down
+static void go_to_wifi_settings_cb(lv_event_t *e); // defined next to build_wifi_settings_screen(), further down
+static void connect_to_saved_network_cb(lv_event_t *e); // needs pending_wifi_ssid/wifi_credentials_pending, defined further down alongside change_wifi_cb
+static void show_wifi_reset_confirm_cb(lv_event_t *e); // defined next to build_wifi_settings_screen(), further down
 
 static lv_obj_t *seg_text_btn, *seg_text_lbl_ref;
 static lv_obj_t *seg_sign_btn, *seg_sign_lbl_ref;
@@ -381,6 +695,31 @@ static void update_connection_status_poll_cb(lv_timer_t *t)
     update_connection_status();
 }
 
+// wifi_current_network_lbl only exists once the Wi-Fi settings screen has
+// been opened once (built lazily by go_to_wifi_settings_cb) — same
+// null-guard reasoning as wifi_status_box above.
+static void update_wifi_current_network_display_cb(lv_timer_t *t)
+{
+    if (!wifi_current_network_lbl) return;
+    if (WiFi.status() == WL_CONNECTED) {
+        lv_label_set_text(wifi_current_network_lbl, WiFi.SSID().c_str());
+    } else {
+        lv_label_set_text(wifi_current_network_lbl, "غير متصلة");
+    }
+}
+
+// يرصد لحظة رجوع نتيجة مسح الشبكات القريبة (نفس نمط was_ready اللي تستخدمه
+// update_wifi_status_display_cb فوق) ويعيد بناء القائمة عندها — قبل هذا،
+// refresh_wifi_saved_list() نفسها تكون عارضة "جارٍ البحث...".
+static void update_wifi_scan_result_poll_cb(lv_timer_t *t)
+{
+    static bool was_ready = false;
+    if (wifi_scan_for_settings_ready && !was_ready) {
+        refresh_wifi_saved_list();
+    }
+    was_ready = wifi_scan_for_settings_ready;
+}
+
 static lv_obj_t *confirm_modal_overlay = NULL;
 
 static void close_confirm_modal_cb(lv_event_t *e)
@@ -391,17 +730,18 @@ static void close_confirm_modal_cb(lv_event_t *e)
     }
 }
 
-static void confirm_disconnect_cb(lv_event_t *e)
+// Replaces the old "فصل الساعة عن الجوال", which only closed the socket: with
+// the app holding a persistent connection it reconnected within ~2s, so the
+// button did nothing visible — and a disconnect that *stayed* disconnected
+// would silently cut off sound alerts for a deaf user. Unpairing is the thing
+// the button actually meant: this phone can't reconnect until it pairs again.
+static void confirm_unpair_cb(lv_event_t *e)
 {
-    // Just requests it here (UI task) — network_task actually closes the
-    // socket and phone_connected updates once that's really happened; the
-    // periodic status-poll timer (see setup()) picks up the change within
-    // half a second, same as any other real disconnect.
-    disconnect_requested = true;
+    security_reset_requested = true;
     close_confirm_modal_cb(e);
 }
 
-static void show_disconnect_confirm_cb(lv_event_t *e)
+static void show_unpair_confirm_cb(lv_event_t *e)
 {
     lv_obj_t *parent = lv_screen_active();
 
@@ -424,7 +764,7 @@ static void show_disconnect_confirm_cb(lv_event_t *e)
     lv_obj_center(card);
 
     lv_obj_t *question = lv_label_create(card);
-    lv_label_set_text(question, "هل فعلاً تبي تفصل الساعة عن الجوال؟");
+    lv_label_set_text(question, "إلغاء ارتباط الهاتف؟ لازم تربطين التطبيق من جديد بعدها.");
     lv_obj_set_style_text_font(question, &tajawal_regular_16, 0);
     lv_obj_set_style_text_color(question, COLOR_TEXT, 0);
     lv_obj_set_width(question, lv_pct(100));
@@ -435,9 +775,9 @@ static void show_disconnect_confirm_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(yes_btn, COLOR_DISCONNECTED, 0);
     lv_obj_set_style_bg_opa(yes_btn, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(yes_btn, 10, 0);
-    lv_obj_add_event_cb(yes_btn, confirm_disconnect_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(yes_btn, confirm_unpair_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *yes_lbl = lv_label_create(yes_btn);
-    lv_label_set_text(yes_lbl, "نعم، افصل");
+    lv_label_set_text(yes_lbl, "نعم، ألغِ الارتباط");
     lv_obj_set_style_text_font(yes_lbl, &tajawal_regular_16, 0);
     lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
     lv_obj_center(yes_lbl);
@@ -951,6 +1291,13 @@ static void trigger_vibration(char pattern, char intensity)
         default: return;
     }
     instance.setHapticEffects(effect);
+    // يكرر نفس التأثير مرتين بفاصل ٤٠٠ms — جُرّب بمقارنة مباشرة مع ٣ تكرارات
+    // وفُضّل عليها (الإحساس التراكمي بمرتين كان أوضح فعليًا من ٣). محاولة
+    // سابقة بفاصل قصير (150ms) سبّبت طوفان أخطاء I2C ("probe failed")
+    // متلاحقة لأن الموجة السابقة ما كانت تخلص تشغيلها فعليًا قبل الطلب
+    // الجديد؛ ٤٠٠ms مؤكد آمن (صفر أخطاء بعدة اختبارات فعلية).
+    instance.vibrator();
+    delay(400);
     instance.vibrator();
 }
 
@@ -1115,20 +1462,20 @@ static void build_settings_screen()
     }
 
     // action buttons
-    lv_obj_t *disconnect_btn = lv_button_create(content);
-    lv_obj_set_size(disconnect_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(disconnect_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(disconnect_btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_border_opa(disconnect_btn, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(disconnect_btn, 1, 0);
-    lv_obj_set_style_radius(disconnect_btn, 10, 0);
-    lv_obj_set_style_margin_top(disconnect_btn, 6, 0);
-    lv_obj_add_event_cb(disconnect_btn, show_disconnect_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *disconnect_lbl = lv_label_create(disconnect_btn);
-    lv_label_set_text(disconnect_lbl, "فصل الساعة عن الجوال");
-    lv_obj_set_style_text_font(disconnect_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(disconnect_lbl, COLOR_TEXT, 0);
-    lv_obj_center(disconnect_lbl);
+    lv_obj_t *unpair_btn = lv_button_create(content);
+    lv_obj_set_size(unpair_btn, lv_pct(100), 36);
+    lv_obj_set_style_bg_opa(unpair_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(unpair_btn, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_opa(unpair_btn, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(unpair_btn, 1, 0);
+    lv_obj_set_style_radius(unpair_btn, 10, 0);
+    lv_obj_set_style_margin_top(unpair_btn, 6, 0);
+    lv_obj_add_event_cb(unpair_btn, show_unpair_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *unpair_lbl = lv_label_create(unpair_btn);
+    lv_label_set_text(unpair_lbl, "إلغاء ارتباط الهاتف");
+    lv_obj_set_style_text_font(unpair_lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(unpair_lbl, COLOR_TEXT, 0);
+    lv_obj_center(unpair_lbl);
 
     lv_obj_t *restart_btn = lv_button_create(content);
     lv_obj_set_size(restart_btn, lv_pct(100), 36);
@@ -1151,13 +1498,278 @@ static void build_settings_screen()
     lv_obj_set_style_border_opa(change_wifi_btn, LV_OPA_30, 0);
     lv_obj_set_style_border_width(change_wifi_btn, 1, 0);
     lv_obj_set_style_radius(change_wifi_btn, 10, 0);
-    lv_obj_add_event_cb(change_wifi_btn, change_wifi_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(change_wifi_btn, go_to_wifi_settings_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *change_wifi_lbl = lv_label_create(change_wifi_btn);
-    lv_label_set_text(change_wifi_lbl, "تغيير شبكة الواي فاي");
+    lv_label_set_text(change_wifi_lbl, "شبكة الواي فاي");
     lv_obj_set_style_text_font(change_wifi_lbl, &tajawal_regular_16, 0);
     lv_obj_set_style_text_color(change_wifi_lbl, COLOR_TEXT, 0);
     lv_obj_center(change_wifi_lbl);
 
+}
+
+// يعيد بناء صفوف الشبكات المحفوظة داخل wifi_saved_list من saved_networks[]
+// الحالية. يُستدعى كل ما تُفتح الشاشة (عشان يعكس شبكة جديدة انضافت من زر
+// "تغيير الشبكة") وبعد أي تغيير على القائمة (اتصال بشبكة محفوظة، أو مسح الكل).
+// يعرض صف واحد فاضٍ برسالة عامة (مستخدم لحالتي "لا توجد شبكات محفوظة" و
+// "لا توجد شبكات بالمدى") — تكرار الأربع أسطر نفسها ثلاث مرات ما كان يستاهل.
+static void show_wifi_list_message(const char *text)
+{
+    lv_obj_t *lbl = lv_label_create(wifi_saved_list);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(lbl, COLOR_MUTED, 0);
+    lv_obj_set_width(lbl, lv_pct(100));
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+// يعيد بناء صفوف الشبكات المحفوظة داخل wifi_saved_list من saved_networks[]،
+// لكن يعرض بس اللي منها ظاهرة بآخر مسح (nearby_ssids[] — انظر تعليق
+// wifi_scan_for_settings_requested) عشان المستخدم ما يحاول يتصل بشبكة بعيدة
+// عن غير قصد. الشبكة المتصلة بها الآن تظهر دايمًا حتى لو غابت عن المسح
+// الأخير (فرق توقيت بسيط بين المسح والاتصال الفعلي، نادر لكن ممكن).
+static void refresh_wifi_saved_list()
+{
+    if (!wifi_saved_list) return;
+    lv_obj_clean(wifi_saved_list); // يشيل كل الصفوف القديمة قبل ما نعيد بناءها
+
+    if (saved_network_count == 0) {
+        show_wifi_list_message("لا توجد شبكات محفوظة");
+        return;
+    }
+    if (!wifi_scan_for_settings_ready) {
+        show_wifi_list_message("جارٍ البحث عن الشبكات القريبة...");
+        return;
+    }
+
+    bool wifi_up = (WiFi.status() == WL_CONNECTED);
+    int shown = 0;
+    for (int i = 0; i < saved_network_count; i++) {
+        bool is_current = wifi_up && WiFi.SSID() == saved_networks[i].ssid;
+        bool nearby = is_current;
+        for (int s = 0; !nearby && s < nearby_ssid_count; s++) {
+            if (nearby_ssids[s] == saved_networks[i].ssid) nearby = true;
+        }
+        if (!nearby) continue;
+        shown++;
+
+        lv_obj_t *row = lv_button_create(wifi_saved_list);
+        lv_obj_set_size(row, lv_pct(100), 40);
+        lv_obj_set_style_bg_opa(row, LV_OPA_10, 0);
+        lv_obj_set_style_bg_color(row, lv_color_white(), 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 10, 0);
+        // i يُمرَّر كـuser_data عشان connect_to_saved_network_cb يعرف أي شبكة
+        // بالضبط انضغطت — نفس فكرة تمرير فهرس لعنصر بقائمة ديناميكية.
+        lv_obj_add_event_cb(row, connect_to_saved_network_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *row_lbl = lv_label_create(row);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%s%s", saved_networks[i].ssid, is_current ? "  (متصلة الآن)" : "");
+        lv_label_set_text(row_lbl, buf);
+        lv_obj_set_style_text_font(row_lbl, &tajawal_regular_16, 0);
+        lv_obj_set_style_text_color(row_lbl, is_current ? lv_color_hex(0x35D07F) : COLOR_TEXT, 0);
+        lv_obj_center(row_lbl);
+    }
+    if (shown == 0) {
+        show_wifi_list_message("لا توجد شبكات محفوظة بالمدى حاليًا");
+    }
+}
+
+static void go_to_wifi_settings_cb(lv_event_t *e)
+{
+    if (!wifi_settings_screen) {
+        build_wifi_settings_screen();
+    }
+    // كل ما نفتح الشاشة نطلب مسح جديد — نتيجة مسح قديمة ممكن تكون قديمة
+    // (شبكة راحت من المدى أو جت وحدة جديدة) — و"جارٍ البحث" تبان فورًا لين
+    // يرد network_task (انظر update_wifi_scan_result_poll_cb بـsetup()).
+    wifi_scan_for_settings_ready = false;
+    wifi_scan_for_settings_requested = true;
+    refresh_wifi_saved_list();
+    lv_screen_load_anim(wifi_settings_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+}
+
+static void go_to_settings_from_wifi_cb(lv_event_t *e)
+{
+    lv_screen_load_anim(settings_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+}
+
+static void close_wifi_reset_confirm_cb(lv_event_t *e)
+{
+    if (wifi_reset_confirm_overlay) {
+        lv_obj_delete(wifi_reset_confirm_overlay);
+        wifi_reset_confirm_overlay = NULL;
+    }
+}
+
+// المسح نفسه (clear_saved_networks + تحديث القائمة) يصير هنا فورًا على مهمة
+// الواجهة — نفس ما ذكرناه بتعليق wifi_reset_requested: NVS مو مقيدة بمهمة
+// معينة بهذا الملف. wifi_reset_requested يبقى فقط لطلب قطع الراديو الفعلي
+// من مهمة الشبكة (تلك اللي تملك WiFi.disconnect()/الاتصال الحالي).
+static void confirm_wifi_reset_cb(lv_event_t *e)
+{
+    clear_saved_networks();
+    refresh_wifi_saved_list();
+    wifi_reset_requested = true;
+    close_wifi_reset_confirm_cb(e);
+}
+
+static void show_wifi_reset_confirm_cb(lv_event_t *e)
+{
+    lv_obj_t *parent = lv_screen_active();
+
+    wifi_reset_confirm_overlay = lv_obj_create(parent);
+    lv_obj_remove_style_all(wifi_reset_confirm_overlay);
+    lv_obj_set_size(wifi_reset_confirm_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wifi_reset_confirm_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wifi_reset_confirm_overlay, LV_OPA_60, 0);
+    lv_obj_center(wifi_reset_confirm_overlay);
+
+    lv_obj_t *card = lv_obj_create(wifi_reset_confirm_overlay);
+    lv_obj_set_size(card, lv_pct(85), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, COLOR_PRIMARY, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 12, 0);
+    lv_obj_center(card);
+
+    lv_obj_t *question = lv_label_create(card);
+    lv_label_set_text(question, "هل فعلاً تبي تمسح كل الشبكات المحفوظة؟");
+    lv_obj_set_style_text_font(question, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(question, COLOR_TEXT, 0);
+    lv_obj_set_width(question, lv_pct(100));
+    lv_obj_set_style_text_align(question, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *yes_btn = lv_button_create(card);
+    lv_obj_set_size(yes_btn, lv_pct(100), 36);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_DISCONNECTED, 0);
+    lv_obj_set_style_bg_opa(yes_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(yes_btn, 10, 0);
+    lv_obj_add_event_cb(yes_btn, confirm_wifi_reset_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "نعم، امسح الكل");
+    lv_obj_set_style_text_font(yes_lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
+    lv_obj_center(yes_lbl);
+
+    lv_obj_t *no_btn = lv_button_create(card);
+    lv_obj_set_size(no_btn, lv_pct(100), 36);
+    lv_obj_set_style_bg_opa(no_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(no_btn, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(no_btn, LV_OPA_40, 0);
+    lv_obj_set_style_border_width(no_btn, 1, 0);
+    lv_obj_set_style_radius(no_btn, 10, 0);
+    lv_obj_add_event_cb(no_btn, close_wifi_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "لا");
+    lv_obj_set_style_text_font(no_lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(no_lbl, COLOR_TEXT, 0);
+    lv_obj_center(no_lbl);
+}
+
+static void build_wifi_settings_screen()
+{
+    wifi_settings_screen = make_screen();
+
+    lv_obj_t *header = lv_obj_create(wifi_settings_screen);
+    lv_obj_remove_style_all(header);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(header, lv_pct(100), 28);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *back_btn = lv_button_create(header);
+    lv_obj_set_style_bg_opa(back_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_width(back_btn, 0, 0);
+    lv_obj_set_style_pad_all(back_btn, 0, 0);
+    lv_obj_set_size(back_btn, 28, 28);
+    lv_obj_align(back_btn, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_event_cb(back_btn, go_to_settings_from_wifi_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(back_icon, COLOR_TEXT, 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "الإنترنت ");
+    lv_obj_set_style_text_font(title, &tajawal_bold_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_TEXT, 0);
+    lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+
+    lv_obj_t *content = lv_obj_create(wifi_settings_screen);
+    lv_obj_remove_style_all(content);
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_align_to(content, header, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 10, 0);
+
+    // الشبكة الحالية
+    lv_obj_t *current_section = lv_label_create(content);
+    lv_label_set_text(current_section, "الشبكة الحالية");
+    lv_obj_set_style_text_font(current_section, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(current_section, COLOR_MUTED, 0);
+    lv_obj_set_width(current_section, lv_pct(100));
+    lv_obj_set_style_text_align(current_section, LV_TEXT_ALIGN_RIGHT, 0);
+
+    wifi_current_network_lbl = lv_label_create(content);
+    lv_label_set_text(wifi_current_network_lbl, "..."); // update_wifi_current_network_poll_cb (setup()) يملأها فورًا
+    lv_obj_set_style_text_font(wifi_current_network_lbl, &tajawal_bold_24, 0);
+    lv_obj_set_style_text_color(wifi_current_network_lbl, COLOR_TEXT, 0);
+    lv_obj_set_width(wifi_current_network_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(wifi_current_network_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+
+    // تغيير الشبكة (يضيف شبكة جديدة عبر نفس تدفق BLE/نقطة الوصول الحالي)
+    lv_obj_t *change_btn = lv_button_create(content);
+    lv_obj_set_size(change_btn, lv_pct(100), 36);
+    lv_obj_set_style_bg_opa(change_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(change_btn, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_opa(change_btn, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(change_btn, 1, 0);
+    lv_obj_set_style_radius(change_btn, 10, 0);
+    lv_obj_set_style_margin_top(change_btn, 6, 0);
+    lv_obj_add_event_cb(change_btn, change_wifi_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *change_lbl = lv_label_create(change_btn);
+    lv_label_set_text(change_lbl, "تغيير الشبكة");
+    lv_obj_set_style_text_font(change_lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(change_lbl, COLOR_TEXT, 0);
+    lv_obj_center(change_lbl);
+
+    // مسح كل الشبكات المحفوظة
+    lv_obj_t *reset_btn = lv_button_create(content);
+    lv_obj_set_size(reset_btn, lv_pct(100), 36);
+    lv_obj_set_style_bg_opa(reset_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(reset_btn, COLOR_DISCONNECTED, 0);
+    lv_obj_set_style_border_opa(reset_btn, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(reset_btn, 1, 0);
+    lv_obj_set_style_radius(reset_btn, 10, 0);
+    lv_obj_add_event_cb(reset_btn, show_wifi_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *reset_lbl = lv_label_create(reset_btn);
+    lv_label_set_text(reset_lbl, "مسح كل الشبكات المحفوظة");
+    lv_obj_set_style_text_font(reset_lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(reset_lbl, COLOR_DISCONNECTED, 0);
+    lv_obj_center(reset_lbl);
+
+    // الشبكات المحفوظة
+    lv_obj_t *saved_section = lv_label_create(content);
+    lv_label_set_text(saved_section, "الشبكات المحفوظة");
+    lv_obj_set_style_text_font(saved_section, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(saved_section, COLOR_MUTED, 0);
+    lv_obj_set_width(saved_section, lv_pct(100));
+    lv_obj_set_style_text_align(saved_section, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_margin_top(saved_section, 6, 0);
+
+    wifi_saved_list = lv_obj_create(content);
+    lv_obj_remove_style_all(wifi_saved_list);
+    lv_obj_remove_flag(wifi_saved_list, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(wifi_saved_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(wifi_saved_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(wifi_saved_list, 6, 0);
+    // الصفوف الفعلية تُبنى بـrefresh_wifi_saved_list()، تستدعى من go_to_wifi_settings_cb
 }
 
 // Floating toast/snackbar for the "change Wi-Fi" button, built once at boot
@@ -1231,9 +1843,8 @@ static void build_wifi_toast()
 // LVGL objects must only ever be touched from the one task that also calls
 // lv_timer_handler().
 
-// Pinned Wi-Fi credentials. load_wifi_credentials() below always returns
-// these now (NVS-saved/BLE-provisioned values are ignored) — see
-// BLE_PROVISIONING_ENABLED just below for why.
+// Only used by load_wifi_credentials() as a last resort, before any network
+// has ever been saved (saved_networks[] still empty) — see that function.
 static const char *WIFI_SSID_FALLBACK = "OWAIS_4G";
 static const char *WIFI_PASSWORD_FALLBACK = "0530331339";
 
@@ -1261,7 +1872,32 @@ static const bool BLE_PROVISIONING_ENABLED = false;
 // hand-off BLE provisioning used, so everything downstream of that
 // (saving to NVS, reconnecting, notifying) is unchanged.
 static const bool WIFI_AP_PROVISIONING_ENABLED = true;
-#define WIFI_AP_SSID "Nabeeh_Watch" // open network (no password) — setup-only, brief
+// The suffix comes from this watch's own MAC address, so two watches being
+// set up nearby never advertise the same network name. The AP itself stays
+// open for compatibility with captive-portal detection; the fresh, on-screen
+// three-digit code below protects the only sensitive action: saving Wi-Fi
+// credentials to the watch.
+#define WIFI_AP_SSID_PREFIX "Nabeeh_Setup"
+#define WIFI_SETUP_PIN_DIGITS 3
+static char wifi_ap_ssid[32] = "";
+static char wifi_setup_pin[WIFI_SETUP_PIN_DIGITS + 1] = "";
+
+static void prepare_wifi_setup_identity()
+{
+    // Must run after WiFi.mode(...) has enabled the STA interface. The last
+    // two bytes are stable for this hardware and make a short, readable ID.
+    if (wifi_ap_ssid[0] == '\0') {
+        uint8_t mac[6] = {};
+        WiFi.macAddress(mac);
+        snprintf(wifi_ap_ssid, sizeof(wifi_ap_ssid), "%s-%02X%02X",
+                 WIFI_AP_SSID_PREFIX, mac[4], mac[5]);
+    }
+
+    // A new code for every setup window: a code seen during an old setup
+    // cannot be reused when the owner opens Wi-Fi setup again later.
+    snprintf(wifi_setup_pin, sizeof(wifi_setup_pin), "%03u",
+             (unsigned)(esp_random() % 1000));
+}
 
 static DNSServer portal_dns;
 static WebServer portal_server(80);
@@ -1273,6 +1909,42 @@ static bool portal_active = false;
 // in this file, just for UI feedback instead of a credential hand-off.
 static volatile bool portal_ready_for_ui = false;
 static volatile bool wifi_setup_dismissed = false;
+// The toast that shows the setup network name/PIN used to pop up on ANY
+// screen the moment portal_ready_for_ui went true — including when setup
+// mode kicked in on its own (e.g. a saved network's password stopped
+// working and the watch fell back to broadcasting its own setup hotspot).
+// That read as a random popup appearing while just opening Settings. It now
+// only shows when the user actually tapped "تغيير الشبكة" — change_wifi_cb
+// sets this true, update_wifi_status_display_cb checks it before showing the
+// box, and it's cleared once the box hides again.
+static volatile bool wifi_setup_shown_by_user = false;
+// Guards against rapid repeated taps on a saved-network row: each tap
+// disconnects and restarts WiFi.begin() (see connect_to_saved_network_cb),
+// so tapping again before the previous attempt resolves just interrupts its
+// handshake mid-flight — confirmed on a real device, logged as repeated
+// "Reconnecting to newly provisioned..." lines seconds apart with
+// AUTH_EXPIRE in between, which reads to the user as the watch randomly
+// disconnecting/reconnecting from the phone. Set true the moment a tap is
+// accepted, cleared once network_task's wifi_reconnect_pending resolves
+// (success or failure) — see both branches of that block.
+static volatile bool wifi_switch_in_progress = false;
+
+// Set by network_task (core 0) right after a reconnect (BLE/AP reprovision or
+// tapping a saved network) resolves to WL_CONNECTED — tells the UI task to
+// rebuild the saved-networks list so the green "(متصلة الآن)" marker moves to
+// the newly-connected network immediately, instead of only updating the next
+// time the Wi-Fi settings screen happens to be re-opened.
+static volatile bool wifi_saved_list_needs_refresh = false;
+
+// اختبار مؤقت لتأثيرات مكتبة DRV2605 الاهتزازية (١٢٣ تأثير) — يُرسل عبر
+// USB Serial بصيغة "V<رقم>\n" (مثلًا "V47\n")، تُعالج بـhandle_incoming_byte
+// (أي مهمة) لكن الاهتزاز الفعلي ما يصير إلا بـloop() على مهمة الواجهة —
+// نفس قاعدة الملف: DRV2605 على نفس ناقل I2C اللي عليه RTC/PMU، فأي استدعاء
+// من مهمة الشبكة يخاطر بتجميد الناقل (صار فعليًا أثناء اختبار سابق).
+static volatile int pending_vib_test_effect = 0; // 0 = لا يوجد طلب معلّق
+static bool vib_test_rx_active = false;
+static char vib_test_buf[8];
+static size_t vib_test_len = 0;
 // Set by the toast's close (X) button (UI task); network_task tears down
 // whichever provisioning method is actually running (or about to start)
 // and resets portal_ready_for_ui, same hand-off pattern as everything else
@@ -1286,7 +1958,6 @@ static volatile bool cancel_wifi_setup_requested = false;
 
 static BLECharacteristic *status_characteristic = nullptr;
 
-static Preferences wifi_prefs;
 static char pending_wifi_ssid[64] = "";
 static char pending_wifi_pass[64] = "";
 static volatile bool wifi_credentials_pending = false; // set by the BLE callback (its own task), consumed by network_task
@@ -1418,6 +2089,10 @@ static void handle_portal_root()
 {
     String page = String(PORTAL_PAGE_HEAD) +
         "<form id=\"wifiForm\" method=\"POST\" action=\"/save\">"
+        "<p>Enter the 3-digit setup code shown on your watch.</p>"
+        "<label>Setup code</label>"
+        "<input name=\"setup_pin\" inputmode=\"numeric\" pattern=\"[0-9]{3}\" maxlength=\"3\" "
+        "placeholder=\"000\" autocomplete=\"one-time-code\" required>"
         "<label>Wi-Fi network</label>"
         "<div class=\"select-wrap\"><select id=\"ssidSelect\" disabled><option value=\"\">Scanning for networks…</option></select></div>"
         "<input type=\"text\" id=\"ssidManual\" name=\"ssid\" placeholder=\"Network name\" style=\"display:none\" "
@@ -1531,8 +2206,19 @@ static void handle_portal_scan()
 // either way.
 static void handle_portal_save()
 {
+    String setup_pin = portal_server.arg("setup_pin");
     String ssid = portal_server.arg("ssid");
     String pass = portal_server.arg("password");
+
+    if (setup_pin != wifi_setup_pin) {
+        portal_server.send(403, "text/html",
+            String(PORTAL_PAGE_HEAD) +
+            "<p style=\"color:#ff8080\">Incorrect setup code. Check the watch and try again.</p>"
+            "<button onclick=\"history.back()\">Go back</button>" +
+            String(PORTAL_PAGE_TAIL));
+        Serial.println("Wi-Fi AP provisioning: rejected credentials with an incorrect setup code.");
+        return;
+    }
 
     if (ssid.length() == 0 || ssid.length() >= sizeof(pending_wifi_ssid) || pass.length() >= sizeof(pending_wifi_pass)) {
         portal_server.send(400, "text/html",
@@ -1563,7 +2249,16 @@ static void start_wifi_ap_provisioning()
     // needs the station radio active too, alongside the AP the phone
     // connects to.
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(WIFI_AP_SSID); // open network — brief, setup-only
+    // بدون هذا، جهة STA تفضل تحاول تتصل تلقائيًا بآخر شبكة كانت تحاولها قبل
+    // دخول وضع الإعداد (زي WIFI_SSID_FALLBACK لو ما فيه شبكات محفوظة) —
+    // محاولات متكررة كل ~٢ ثانية تزاحم راديو الواي فاي مع بث شبكة الإعداد
+    // (AP) نفسها، فتخليه غير مستقر أو يختفي من قائمة شبكات الجوال. جهة STA
+    // هنا لازم تفضل خاملة تمامًا طول وضع الإعداد — تُستخدم بس للمسح عند
+    // الطلب (WiFi.scanNetworks تحت)، مو للاتصال.
+    WiFi.disconnect();
+    WiFi.setAutoReconnect(false);
+    prepare_wifi_setup_identity();
+    WiFi.softAP(wifi_ap_ssid); // open network — brief, setup-only; portal requires the on-screen PIN
     IPAddress ap_ip = WiFi.softAPIP(); // normally 192.168.4.1
     WiFi.scanNetworks(true, false); // kick off async now, so it's likely already done by the time the phone loads the page
 
@@ -1589,8 +2284,8 @@ static void start_wifi_ap_provisioning()
     portal_server.begin();
     portal_active = true;
     portal_ready_for_ui = true; // tells the Settings screen's status label to show the network name
-    Serial.printf("Wi-Fi AP provisioning: advertising as '%s' (open network), setup page at http://%s/\n",
-                  WIFI_AP_SSID, ap_ip.toString().c_str());
+    Serial.printf("Wi-Fi AP provisioning: advertising as '%s' (open network, PIN %s), setup page at http://%s/\n",
+                  wifi_ap_ssid, wifi_setup_pin, ap_ip.toString().c_str());
 }
 
 static void stop_wifi_ap_provisioning()
@@ -1626,7 +2321,51 @@ static void change_wifi_cb(lv_event_t *e)
         lv_label_set_text(wifi_status_label, "جارٍ تجهيز شبكة الإعداد...");
         lv_obj_remove_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
     }
+    wifi_setup_shown_by_user = true;
+    // لازم نصفّرها هنا، مو نعتمد بس على start_wifi_ap_provisioning() تحت —
+    // تلك الدالة ترجع فورًا بدون ما تصفّرها لو الشبكة شغّالة أصلًا
+    // (portal_active)، وهذا بالضبط اللي كان يصير: بعد أول ضغطة X، هذي القيمة
+    // تفضل عالقة true للأبد وتمنع التنبيه من عرض اسم الشبكة/الرمز أي مرة
+    // بعدها — مؤكد بتشخيص فعلي على جهاز حقيقي.
+    wifi_setup_dismissed = false;
     ble_restart_requested = true;
+}
+
+// صف شبكة محفوظة انضغط بقائمة شاشة إعدادات الواي فاي. يمرّ بنفس التسليم
+// (pending_wifi_ssid/pending_wifi_pass/wifi_credentials_pending) اللي يستخدمه
+// إعداد BLE/نقطة الوصول — network_task هو من يقطع الاتصال الحالي ويتصل
+// بالشبكة الجديدة، ونفس المكان يعيد استدعاء add_or_update_saved_network()
+// فتصير هذي الشبكة تلقائيًا بالمقدمة (الأحدث استخدامًا).
+static void connect_to_saved_network_cb(lv_event_t *e)
+{
+    if (wifi_switch_in_progress) return; // تجاهل الضغطة — فيه محاولة سابقة لسا ما خلصت
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= saved_network_count) return;
+
+    wifi_switch_in_progress = true;
+    strncpy(pending_wifi_ssid, saved_networks[idx].ssid, sizeof(pending_wifi_ssid) - 1);
+    pending_wifi_ssid[sizeof(pending_wifi_ssid) - 1] = '\0';
+    strncpy(pending_wifi_pass, saved_networks[idx].pass, sizeof(pending_wifi_pass) - 1);
+    pending_wifi_pass[sizeof(pending_wifi_pass) - 1] = '\0';
+    wifi_credentials_pending = true;
+
+    if (wifi_status_box) {
+        lv_obj_set_style_bg_color(wifi_status_box, COLOR_PRIMARY, 0);
+        lv_obj_set_style_bg_opa(wifi_status_box, LV_OPA_COVER, 0);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "جارٍ الاتصال بـ%s...", saved_networks[idx].ssid);
+        lv_label_set_text(wifi_status_label, buf);
+        lv_obj_remove_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
+        // ما فيه إشعار "نجح" مخصص لهذا المسار (بخلاف تدفق نقطة الوصول اللي
+        // يراقبه update_wifi_status_display_cb عبر portal_ready_for_ui) —
+        // نخفيه تلقائيًا بعد مهلة معقولة بدل ما يعلّق على الشاشة للأبد.
+        lv_timer_t *t = lv_timer_create(
+            [](lv_timer_t *t) {
+                if (wifi_status_box) lv_obj_add_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
+            },
+            4000, NULL);
+        lv_timer_set_repeat_count(t, 1);
+    }
 }
 
 // The toast's close (X) button — hides it immediately here (UI task) and
@@ -1639,6 +2378,7 @@ static void cancel_wifi_setup_cb(lv_event_t *e)
         lv_obj_add_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
     }
     wifi_setup_dismissed = true;
+    wifi_setup_shown_by_user = false;
     cancel_wifi_setup_requested = true;
 }
 
@@ -1648,35 +2388,45 @@ static void cancel_wifi_setup_cb(lv_event_t *e)
 static void update_wifi_status_display_cb(lv_timer_t *t)
 {
     static bool was_ready = false;
+    static bool last_dbg_ready = false, last_dbg_shown = false, last_dbg_dismissed = false;
+    if (portal_ready_for_ui != last_dbg_ready || wifi_setup_shown_by_user != last_dbg_shown || wifi_setup_dismissed != last_dbg_dismissed) {
+        Serial.printf("DBG toast state: portal_ready=%d shown_by_user=%d dismissed=%d was_ready=%d\n",
+                      portal_ready_for_ui, wifi_setup_shown_by_user, wifi_setup_dismissed, was_ready);
+        last_dbg_ready = portal_ready_for_ui;
+        last_dbg_shown = wifi_setup_shown_by_user;
+        last_dbg_dismissed = wifi_setup_dismissed;
+    }
+    if (wifi_saved_list_needs_refresh) {
+        wifi_saved_list_needs_refresh = false;
+        refresh_wifi_saved_list(); // no-op if wifi_saved_list is NULL (settings screen not built yet)
+    }
+
     if (!wifi_status_box) return; // Settings screen not built yet — nothing to update
 
-    if (portal_ready_for_ui && !wifi_setup_dismissed && !was_ready) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "اتصل من جوالك بشبكة:\n%s", WIFI_AP_SSID);
+    if (portal_ready_for_ui && wifi_setup_shown_by_user && !wifi_setup_dismissed && !was_ready) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "اتصل من جوالك بشبكة:\n%s\nرمز الإعداد: %s",
+                 wifi_ap_ssid, wifi_setup_pin);
         lv_label_set_text(wifi_status_label, buf); // same COLOR_PRIMARY box change_wifi_cb() already showed — only the text changes, no color swap
         lv_obj_remove_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
-    } else if ((!portal_ready_for_ui || wifi_setup_dismissed) && was_ready) {
+    } else if ((!portal_ready_for_ui || wifi_setup_dismissed || !wifi_setup_shown_by_user) && was_ready) {
         lv_label_set_text(wifi_status_label, "");
         lv_obj_add_flag(wifi_status_box, LV_OBJ_FLAG_HIDDEN);
+        wifi_setup_shown_by_user = false;
     }
-    was_ready = portal_ready_for_ui;
+    was_ready = portal_ready_for_ui && wifi_setup_shown_by_user;
 }
 
-// Prefers whatever was last saved to NVS by a successful BLE provisioning
-// (see save_wifi_credentials below); falls back to the hardcoded
-// WIFI_SSID_FALLBACK/WIFI_PASSWORD_FALLBACK only the first time, before
-// anything has ever been provisioned.
+// يجرب آخر شبكة استُخدمت (saved_networks[0] — انظر add_or_update_saved_network)
+// أولًا، ولا يرجع للقيمة الثابتة WIFI_SSID_FALLBACK/WIFI_PASSWORD_FALLBACK إلا
+// لو القائمة فاضية تمامًا (أول إقلاع قبل أي إعداد على الإطلاق).
 static void load_wifi_credentials(char *ssid_out, size_t ssid_len, char *pass_out, size_t pass_len)
 {
-    wifi_prefs.begin("nabeeh", true); // read-only
-    String saved_ssid = wifi_prefs.getString("wifi_ssid", "");
-    String saved_pass = wifi_prefs.getString("wifi_pass", "");
-    wifi_prefs.end();
-
-    if (saved_ssid.length() > 0 && saved_ssid.length() < ssid_len && saved_pass.length() < pass_len) {
-        strncpy(ssid_out, saved_ssid.c_str(), ssid_len - 1);
+    load_saved_networks();
+    if (saved_network_count > 0) {
+        strncpy(ssid_out, saved_networks[0].ssid, ssid_len - 1);
         ssid_out[ssid_len - 1] = '\0';
-        strncpy(pass_out, saved_pass.c_str(), pass_len - 1);
+        strncpy(pass_out, saved_networks[0].pass, pass_len - 1);
         pass_out[pass_len - 1] = '\0';
         return;
     }
@@ -1687,12 +2437,28 @@ static void load_wifi_credentials(char *ssid_out, size_t ssid_len, char *pass_ou
     pass_out[pass_len - 1] = '\0';
 }
 
-static void save_wifi_credentials(const char *ssid, const char *pass)
+// عند الإقلاع: يختار أحدث شبكة محفوظة موجودة فعلًا بالمدى الحين، بدل ما يجرب
+// saved_networks[0] بس. بدون هذا، لو آخر شبكة مطفية (راوتر متنقل مثلًا) الساعة
+// تدخل وضع الإعداد مباشرة حتى لو فيه شبكة محفوظة ثانية شغالة جنبها. لو ولا
+// وحدة ظهرت بالمسح (شبكة مخفية مثلًا) يبقى الاختيار الأصلي زي ما هو.
+static void pick_boot_network(char *ssid_out, size_t ssid_len, char *pass_out, size_t pass_len)
 {
-    wifi_prefs.begin("nabeeh", false);
-    wifi_prefs.putString("wifi_ssid", ssid);
-    wifi_prefs.putString("wifi_pass", pass);
-    wifi_prefs.end();
+    if (saved_network_count <= 1) return;
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < saved_network_count; i++) {
+        for (int s = 0; s < n; s++) {
+            if (WiFi.SSID(s) != saved_networks[i].ssid) continue;
+            strncpy(ssid_out, saved_networks[i].ssid, ssid_len - 1);
+            ssid_out[ssid_len - 1] = '\0';
+            strncpy(pass_out, saved_networks[i].pass, pass_len - 1);
+            pass_out[pass_len - 1] = '\0';
+            WiFi.scanDelete();
+            Serial.printf("Boot: saved network '%s' is in range — using it.\n", ssid_out);
+            return;
+        }
+    }
+    WiFi.scanDelete();
+    Serial.println("Boot: no saved network found in scan — trying the most recent one anyway.");
 }
 
 // نحفظ نص الجدول كما وصل (مو المصفوفة المفكوكة): أبسط، ويخلي إعادة التحميل
@@ -1756,8 +2522,86 @@ static const uint16_t TCP_PORT = 3333;
 static const char *MDNS_HOSTNAME = "nabeeh-watch";
 static const size_t CHUNK_SIZE = 1024; // 512 samples @ 16-bit = ~32ms of audio per chunk
 
+// The T-Watch S3's built-in PDM mic reads quiet by default — normal-distance
+// and close-up sounds (e.g. a knock right at the wrist) come in as low-
+// amplitude PCM that the classifier model sees as near-silence. LilyGoLib's
+// mic wrapper doesn't expose a hardware gain register for the PDM peripheral,
+// so we amplify digitally here instead: multiply every 16-bit sample by
+// MIC_SOFTWARE_GAIN and hard-clip to the int16 range (rather than letting it
+// wrap around, which would turn loud sounds into harsh digital noise).
+// Start around 4x and raise/lower after listening to captured audio — too
+// high and the noise floor gets amplified into audible hiss and true loud
+// sounds clip; too low and quiet/near sounds are still missed.
+#define MIC_SOFTWARE_GAIN 6.0f
+// Peak-level testing at gain=4 and gain=10 both showed a suspiciously
+// steady "floor" that scaled exactly with the gain multiplier (~20% at 4x,
+// ~50% at 10x) even during total silence/distance — a real noise floor
+// fluctuates sample to sample, it doesn't sit dead flat. That's the
+// signature of a constant DC bias in the PDM demodulator's output, not
+// random self-noise, and gain alone can never separate real signal from a
+// bias that scales right along with it. A one-pole DC-blocking high-pass
+// filter (standard technique: y[n] = x[n] - x[n-1] + R*y[n-1]) removes a
+// constant offset entirely while passing speech/crying-range frequencies
+// through basically unaffected, so gain afterward amplifies only the real,
+// varying part of the signal.
+static void remove_dc_offset(int16_t *samples, size_t sample_count)
+{
+    static float prev_x = 0.0f;
+    static float prev_y = 0.0f;
+    const float R = 0.995f; // pole near 1 -> very low cutoff, keeps everything above a few Hz
+    for (size_t i = 0; i < sample_count; i++) {
+        float x = (float)samples[i];
+        float y = x - prev_x + R * prev_y;
+        prev_x = x;
+        prev_y = y;
+        if (y > 32767.0f) y = 32767.0f;
+        else if (y < -32768.0f) y = -32768.0f;
+        samples[i] = (int16_t)y;
+    }
+}
+
+static void apply_mic_gain(uint8_t *buf, size_t byte_count, float gain)
+{
+    int16_t *samples = (int16_t *)buf;
+    size_t sample_count = byte_count / sizeof(int16_t);
+    remove_dc_offset(samples, sample_count);
+    for (size_t i = 0; i < sample_count; i++) {
+        int32_t amplified = (int32_t)(samples[i] * gain);
+        if (amplified > INT16_MAX) amplified = INT16_MAX;
+        else if (amplified < INT16_MIN) amplified = INT16_MIN;
+        samples[i] = (int16_t)amplified;
+    }
+}
+
 WiFiServer server(TCP_PORT);
 WiFiClient client;
+// A new connection waits here until it proves it knows device_key (see the
+// AUTH handling around server.available() below); only then is it promoted to
+// `client`. So `client` is always an authenticated session, and nothing an
+// unauthenticated connection sends is ever parsed as a command.
+static WiFiClient pending_client;
+enum PendingStage { PENDING_AWAIT_PAIR, PENDING_AWAIT_AUTH };
+static PendingStage pending_stage = PENDING_AWAIT_AUTH;
+static bool pending_is_pairing = false;
+static uint8_t pending_key[DEVICE_KEY_LEN]; // device_key, or the freshly agreed key while pairing (saved only once AUTH proves it)
+static uint8_t pair_watch_pub[32];
+static uint8_t auth_nonce[16];
+static char auth_line_buf[80]; // "PAIR,"/"AUTH," + 64 hex chars, the longest line this parser needs
+static size_t auth_line_len = 0;
+static unsigned long auth_challenge_sent_ms = 0; // start of whichever handshake step is currently waiting on the phone
+#define AUTH_TIMEOUT_MS 5000 // per step — an unauthenticated connection that doesn't respond in time gets dropped
+
+static void send_auth_challenge()
+{
+    esp_fill_random(auth_nonce, sizeof(auth_nonce));
+    char nonce_hex[sizeof(auth_nonce) * 2 + 1];
+    bytes_to_hex(auth_nonce, sizeof(auth_nonce), nonce_hex);
+    size_t sent = pending_client.printf("AUTH,%s\n", nonce_hex);
+    pending_stage = PENDING_AWAIT_AUTH;
+    auth_challenge_sent_ms = millis();
+    Serial.printf("DBG AUTH challenge sent: %u bytes, fd=%d, connected=%d\n",
+                  (unsigned)sent, pending_client.fd(), (int)pending_client.connected());
+}
 static bool mdns_started = false;
 
 static void ensure_mdns_service()
@@ -1791,7 +2635,22 @@ static unsigned long last_client_seen_millis = 0;
 // of reconnecting to poll, this stops mattering almost entirely (see the
 // comment above last_client_seen_millis).
 #define CLIENT_ACTIVITY_TIMEOUT_MS 15000
+#define WIFI_SCAN_TIMEOUT_MS 8000 // safety cap on the Wi-Fi settings screen's "nearby networks" scan — see its use in network_task
 static volatile bool streaming = false; // written on both tasks (Serial on UI task, client on network task), read on network task; a plain flag is fine for this single on/off signal
+// Non-blocking audio send — see the streaming block at the end of network_task.
+static unsigned long last_audio_send_ok_ms = 0;
+static unsigned long audio_drop_count = 0;
+#define AUDIO_SEND_STALL_MS 3000
+
+static bool socket_writable_now(int fd)
+{
+    if (fd < 0) return false;
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    struct timeval tv = {0, 0};
+    return select(fd + 1, NULL, &set, NULL, &tv) > 0;
+}
 
 // '#' now starts a 3-byte sequence: category, then vibration pattern digit
 // ('1'/'2'/'3'), then vibration intensity digit ('1'/'2'/'3') — e.g. "#B11"
@@ -1864,6 +2723,30 @@ static bool is_valid_result_code(char c)
 
 static void handle_incoming_byte(char c, const char *source)
 {
+    if (vib_test_rx_active) {
+        if (c == '\n' || c == '\r') {
+            vib_test_buf[vib_test_len] = '\0';
+            vib_test_rx_active = false;
+            int effect = atoi(vib_test_buf);
+            if (effect >= 1 && effect <= 123) {
+                pending_vib_test_effect = effect; // loop() على مهمة الواجهة هو من يشغّله فعليًا
+            } else {
+                Serial.printf("Vib test (%s): رقم غير صالح \"%s\" — لازم يكون بين 1 و123\n", source, vib_test_buf);
+            }
+            return;
+        } else if (isdigit((unsigned char)c) && vib_test_len < sizeof(vib_test_buf) - 1) {
+            vib_test_buf[vib_test_len++] = c;
+            return;
+        } else {
+            vib_test_rx_active = false; // بايت غلط — نلغي ونكمل تحت كأمر عادي
+        }
+    }
+    if (c == 'v' || c == 'V') {
+        vib_test_rx_active = true;
+        vib_test_len = 0;
+        return;
+    }
+
     if (reminder_rx_active) {
         if (millis() - reminder_rx_started > REMINDER_RX_TIMEOUT_MS) {
             Serial.printf("Reminders (%s): انتهت مهلة الاستقبال — إلغاء\n", source);
@@ -1943,6 +2826,8 @@ static void handle_incoming_byte(char c, const char *source)
             return;
         }
         streaming = true;
+        last_audio_send_ok_ms = millis(); // the 3s "phone gone" window starts now, not at boot
+        audio_drop_count = 0;
         audio_chunks_sent = 0;
         audio_bytes_sent = 0;
         audio_read_started = false;
@@ -2066,6 +2951,7 @@ static void network_task(void *pvParameters)
 {
     char wifi_ssid[64], wifi_pass[64];
     load_wifi_credentials(wifi_ssid, sizeof(wifi_ssid), wifi_pass, sizeof(wifi_pass));
+    ensure_device_key();
 
     // BLE being active AT ALL turned out to risk corrupting whatever screen
     // transition happens to land while it's on — not just the one right
@@ -2078,7 +2964,6 @@ static void network_task(void *pvParameters)
     // provisioning if they fail. It's stopped again below the moment Wi-Fi
     // connects either way (see the loop), so its active window is as short
     // as possible whenever it does have to run.
-    Serial.printf("Connecting to Wi-Fi network: %s\n", wifi_ssid);
     WiFi.mode(WIFI_STA);
     // Arduino-ESP32's built-in auto-reconnect retries roughly every 2s with
     // no backoff — fine normally, but bad credentials (typo'd during a
@@ -2087,6 +2972,8 @@ static void network_task(void *pvParameters)
     // when it's needed most (to fix the bad credentials). Handling
     // reconnects manually below with real backoff avoids that.
     WiFi.setAutoReconnect(false);
+    pick_boot_network(wifi_ssid, sizeof(wifi_ssid), wifi_pass, sizeof(wifi_pass));
+    Serial.printf("Connecting to Wi-Fi network: %s\n", wifi_ssid);
     WiFi.begin(wifi_ssid, wifi_pass);
     unsigned long connect_start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - connect_start < 10000) {
@@ -2103,6 +2990,17 @@ static void network_task(void *pvParameters)
             portal_server.handleClient();
             vTaskDelay(pdMS_TO_TICKS(10)); // short delay: handleClient() needs frequent pumping, unlike BLE's callback-driven model
             if (wifi_credentials_pending) break; // new credentials arrived via the portal — stop retrying the old ones
+            if (cancel_wifi_setup_requested) {
+                // X on the watch during this boot-time wait. This loop runs before
+                // the main for(;;) that normally handles cancel, so without this
+                // the AP kept broadcasting and its PIN never changed.
+                cancel_wifi_setup_requested = false;
+                ble_restart_requested = false;
+                stop_wifi_ap_provisioning();
+                portal_ready_for_ui = false;
+                Serial.println("Wi-Fi setup canceled from the watch.");
+                break;
+            }
         }
         if (WiFi.status() == WL_CONNECTED) {
             stop_wifi_ap_provisioning(); // the original credentials worked after all, just slower than 10s
@@ -2115,6 +3013,14 @@ static void network_task(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(300));
             Serial.print(".");
             if (wifi_credentials_pending) break; // new credentials arrived over BLE — stop retrying the old ones
+            if (cancel_wifi_setup_requested) {
+                cancel_wifi_setup_requested = false;
+                ble_restart_requested = false;
+                stop_ble_provisioning();
+                portal_ready_for_ui = false;
+                Serial.println("Wi-Fi setup canceled from the watch.");
+                break;
+            }
         }
         if (WiFi.status() == WL_CONNECTED) {
             stop_ble_provisioning(); // the original credentials worked after all, just slower than 10s
@@ -2136,6 +3042,8 @@ static void network_task(void *pvParameters)
     Serial.println("Send 'r'/'s' to start/stop mic streaming, or '#'+code (e.g. '#B') to simulate a result.");
 
     bool wifi_reconnect_pending = false; // true from the moment new BLE-provisioned credentials are applied until we know whether they worked
+    bool wifi_scan_in_progress = false;  // true from starting an async scan (Wi-Fi settings screen) until scanComplete() stops returning WIFI_SCAN_RUNNING
+    unsigned long wifi_scan_started_ms = 0;
     unsigned long wifi_reconnect_started = 0;
 
     // General-purpose reconnect with backoff, for any other disconnect
@@ -2155,7 +3063,14 @@ static void network_task(void *pvParameters)
     unsigned long last_ntp_sync_millis = millis(); // initial connect above just did one, if it succeeded
     bool was_connected_last_loop = (WiFi.status() == WL_CONNECTED);
 
+    unsigned long dbg_loop_start = millis();
     for (;;) {
+        unsigned long dbg_now = millis();
+        if (dbg_now - dbg_loop_start > 1000) {
+            Serial.printf("DBG network loop stalled %lu ms\n", dbg_now - dbg_loop_start);
+        }
+        dbg_loop_start = dbg_now;
+
         // Skip entirely while BLE is actively open: that already means Wi-Fi
         // isn't working and someone may be mid-way through fixing it over
         // BLE right now — competing background reconnect attempts (even
@@ -2165,7 +3080,7 @@ static void network_task(void *pvParameters)
             portal_server.handleClient();
         }
 
-        if (!wifi_reconnect_pending && !ble_active && !portal_active) {
+        if (!wifi_reconnect_pending && !ble_active && !portal_active && wifi_ssid[0] != '\0') {
             if (WiFi.status() == WL_CONNECTED) {
                 reconnect_backoff_ms = 2000; // reset once healthy
             } else if (millis() - last_reconnect_attempt >= reconnect_backoff_ms) {
@@ -2206,6 +3121,12 @@ static void network_task(void *pvParameters)
                 Serial.println("Reprovisioned Wi-Fi connected.");
                 Serial.print("Watch IP address: ");
                 Serial.println(WiFi.localIP());
+                // نحفظ بس هنا — بعد ما نتأكد إنها اشتغلت فعليًا — مو لحظة
+                // ما توصل بيانات الاعتماد. حفظها فورًا (السلوك القديم) كان
+                // يخلي كلمة مرور غلط تدخل قائمة الشبكات المحفوظة، فتحاول
+                // الساعة تتصل فيها تلقائيًا للأبد وتدخل وضع الإعداد من كل
+                // إقلاع — بالضبط المشكلة اللي واجهناها مع HUAWEI-B535-447F.
+                add_or_update_saved_network(wifi_ssid, wifi_pass);
                 ensure_mdns_service();
                 sync_rtc_from_ntp();
                 last_ntp_sync_millis = millis();
@@ -2215,24 +3136,32 @@ static void network_task(void *pvParameters)
                     status_characteristic->notify();
                 }
                 stop_ble_provisioning(); // only stops advertising now — safe even with a client still connected, see its own comment
+                wifi_switch_in_progress = false; // clears the guard set in connect_to_saved_network_cb — was never reset, so only the very first tap on a saved network ever worked
+                wifi_saved_list_needs_refresh = true;
             } else if (millis() - wifi_reconnect_started > WIFI_RECONNECT_TIMEOUT_MS) {
                 wifi_reconnect_pending = false;
-                Serial.println("Reprovisioned Wi-Fi failed to connect within 15s.");
+                wifi_switch_in_progress = false; // same guard reset on the failure path
+                Serial.printf("Reprovisioned Wi-Fi failed to connect within 15s — NOT saving '%s' (likely wrong password).\n", wifi_ssid);
                 if (status_characteristic) {
                     status_characteristic->setValue("F");
                     status_characteristic->notify();
                 }
+                // نرجّع للشبكة المحفوظة الأخيرة اللي كانت تشتغل (إن وُجدت)
+                // بدل ما نفضل نحاول بيانات فشلت للأبد بحلقة إعادة الاتصال
+                // العامة تحت — تلك الحلقة تستخدم wifi_ssid/wifi_pass زي ما
+                // هي، وما تعرف إنها فشلت لأول مرة الحين.
+                if (saved_network_count > 0) {
+                    strncpy(wifi_ssid, saved_networks[0].ssid, sizeof(wifi_ssid) - 1);
+                    wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
+                    strncpy(wifi_pass, saved_networks[0].pass, sizeof(wifi_pass) - 1);
+                    wifi_pass[sizeof(wifi_pass) - 1] = '\0';
+                } else {
+                    wifi_ssid[0] = '\0';
+                    wifi_pass[0] = '\0';
+                }
                 // Deliberately leave BLE running on failure so the user can
                 // just try again with different credentials, instead of
                 // having to reopen provisioning from Settings first.
-            }
-        }
-
-        if (disconnect_requested) {
-            disconnect_requested = false;
-            if (client) {
-                Serial.println("Disconnect requested from Settings — closing client connection.");
-                client.stop(); // the checks just below notice this same as any other disconnect and update phone_connected/was_connected accordingly
             }
         }
 
@@ -2247,6 +3176,11 @@ static void network_task(void *pvParameters)
             }
         }
 
+        static bool dbg_last_cancel_flag = false;
+        if (cancel_wifi_setup_requested != dbg_last_cancel_flag) {
+            Serial.printf("DBG cancel flag changed to %d (portal_active=%d)\n", cancel_wifi_setup_requested, portal_active);
+            dbg_last_cancel_flag = cancel_wifi_setup_requested;
+        }
         if (cancel_wifi_setup_requested) {
             cancel_wifi_setup_requested = false;
             ble_restart_requested = false; // in case "start" was tapped and "cancel" beat this loop to processing it
@@ -2262,7 +3196,8 @@ static void network_task(void *pvParameters)
             wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
             strncpy(wifi_pass, pending_wifi_pass, sizeof(wifi_pass) - 1);
             wifi_pass[sizeof(wifi_pass) - 1] = '\0';
-            save_wifi_credentials(wifi_ssid, wifi_pass);
+            // ما نحفظها هنا — نستنى نتأكد إنها اتصلت فعليًا (انظر
+            // wifi_reconnect_pending تحت) قبل ما تدخل قائمة الشبكات المحفوظة.
             Serial.printf("Reconnecting to newly provisioned Wi-Fi network: %s\n", wifi_ssid);
             if (portal_active) {
                 stop_wifi_ap_provisioning(); // drops the AP and switches back to WIFI_STA before reconnecting
@@ -2273,38 +3208,201 @@ static void network_task(void *pvParameters)
             wifi_reconnect_started = millis();
         }
 
+        // "مسح كل الشبكات المحفوظة" من شاشة إعدادات الواي فاي — saved_networks[]
+        // نفسها انمسحت فورًا من مهمة الواجهة (انظر تعليق wifi_reset_requested
+        // عند تعريفها)، وهذا الجزء بس يقطع الراديو الفعلي ويوقف محاولات
+        // إعادة الاتصال بالبيانات القديمة.
+        if (wifi_reset_requested) {
+            wifi_reset_requested = false;
+            wifi_ssid[0] = '\0';
+            wifi_pass[0] = '\0';
+            WiFi.disconnect(true);
+            Serial.println("All saved Wi-Fi networks cleared from the watch.");
+        }
+
+        // شاشة إعدادات الواي فاي تطلب مسح عشان تعرف أي شبكة محفوظة بالمدى
+        // فعلاً (انظر تعليق wifi_scan_for_settings_requested عند تعريفها).
+        // لو فيه مسح شغّال أصلاً (نادر، بس ممكن لو المستخدم فتح الشاشة
+        // مرتين بسرعة) نتجاهل الطلب الجديد ونخلي اللي شغّال يكمل.
+        //
+        // لو الساعة بوضع الإعداد (portal_active — بثّ شبكتها الخاصة بدل ما
+        // تكون عميل بشبكة حقيقية) ما نبدأ مسح جديد أصلًا: هذا الوضع أصلًا
+        // يسوي مسحه الخاص لصفحة الإعداد (انظر start_wifi_ap_provisioning)،
+        // وتشغيل مسحين بنفس الوقت كان يتعارض ويرجّع نتيجة فاضية بدون سبب
+        // واضح للمستخدم. بدلها نرجّع "لا نتائج" فورًا.
+        if (wifi_scan_for_settings_requested && !wifi_scan_in_progress) {
+            wifi_scan_for_settings_requested = false;
+            if (portal_active) {
+                nearby_ssid_count = 0;
+                wifi_scan_for_settings_ready = true;
+            } else {
+                WiFi.scanNetworks(true, false); // async؛ ما يهمنا نعرض شبكات مخفية، ما فيه اسم نعرضه لها أصلًا
+                wifi_scan_in_progress = true;
+                wifi_scan_started_ms = millis();
+            }
+        }
+        if (wifi_scan_in_progress) {
+            int n = WiFi.scanComplete();
+            // مهلة أمان: لو المسح ما خلص خلال WIFI_SCAN_TIMEOUT_MS (تعارض مع
+            // مسح ثاني، أو الراديو مشغول باتصال يعيد المحاولة) نوقف الانتظار
+            // ونعتبره فشل بدل ما تعلّق شاشة "جارٍ البحث..." للأبد.
+            bool timed_out = millis() - wifi_scan_started_ms > WIFI_SCAN_TIMEOUT_MS;
+            if (n != WIFI_SCAN_RUNNING || timed_out) {
+                if (n == WIFI_SCAN_FAILED || n == WIFI_SCAN_RUNNING) n = 0; // n لسا RUNNING فقط لو دخلنا هنا بسبب المهلة
+                nearby_ssid_count = 0;
+                for (int i = 0; i < n && nearby_ssid_count < MAX_SCAN_RESULTS; i++) {
+                    String ssid = WiFi.SSID(i);
+                    if (ssid.length() == 0) continue; // شبكة مخفية — ما نقدر نطابقها باسم أصلًا
+                    nearby_ssids[nearby_ssid_count++] = ssid;
+                }
+                WiFi.scanDelete();
+                wifi_scan_in_progress = false;
+                wifi_scan_for_settings_ready = true;
+            }
+        }
+
         // Checked unconditionally, every loop iteration — not just when the
         // current client "looks" disconnected. client.connected() only goes
         // false once this side notices a clean FIN; a phone app killed or
         // backgrounded mid-connection (no clean close) leaves it reading
-        // true indefinitely, and the old gated version of this check never
-        // even looked at server.available() in that case — so a genuinely
-        // new incoming connection (the app reconnecting) would complete its
-        // TCP handshake at the OS level, then sit unread forever, because
-        // the sketch was still watching the stale client. A new connection
-        // always means the old one is stale (only one phone talks to this
-        // watch at a time), so it always wins immediately.
+        // true indefinitely.
+        //
+        // So a new connection must be able to replace the current one — but
+        // only once it has proven it knows device_key. Until then it waits in
+        // pending_client and the current session keeps running untouched, so
+        // an unauthenticated connection (a stranger on the network, or an app
+        // build that doesn't speak the handshake) can never kick the real app
+        // off or cut an audio stream short. The legit app reconnecting after
+        // its own socket died authenticates and takes over immediately.
+        if (security_reset_requested) {
+            security_reset_requested = false;
+            forget_pairing();
+            if (client) client.stop();         // the old key was just revoked — neither connection can stay trusted
+            if (pending_client) pending_client.stop();
+        }
+
         WiFiClient newClient = server.available();
         if (newClient) {
-            if (streaming && client && client.connected()) {
-                Serial.println("New client rejected: audio stream already owns the TCP connection.");
-                newClient.stop();
+            if (pending_client) {
+                Serial.println("Security: newer connection replaced an unfinished handshake.");
+                pending_client.stop();
+            }
+            pending_client = newClient;
+            pending_client.setNoDelay(true);
+            auth_line_len = 0;
+            pending_is_pairing = !device_paired;
+            Serial.println("Client connecting — awaiting authentication.");
+            if (pending_is_pairing) {
+                unsigned long t0 = millis();
+                if (!pairing_begin(pair_watch_pub)) {
+                    Serial.println("Security: X25519 key generation failed — dropping connection.");
+                    pending_client.stop();
+                } else {
+                    char pub_hex[sizeof(pair_watch_pub) * 2 + 1];
+                    bytes_to_hex(pair_watch_pub, sizeof(pair_watch_pub), pub_hex);
+                    pending_client.printf("PAIR,%s\n", pub_hex);
+                    pending_stage = PENDING_AWAIT_PAIR;
+                    auth_challenge_sent_ms = millis();
+                    Serial.printf("Security: pairing started (key generation took %lu ms).\n", millis() - t0);
+                }
             } else {
+                memcpy(pending_key, device_key, DEVICE_KEY_LEN);
+                send_auth_challenge();
+            }
+        }
+
+        if (pending_client) {
+            bool authenticated = false;
+            if (millis() - auth_challenge_sent_ms > AUTH_TIMEOUT_MS) {
+                Serial.println("Security: client didn't authenticate in time — dropping connection.");
+                pending_client.stop();
+            } else {
+                int drained = 0;
+                while (pending_client && pending_client.available() && drained++ < 512) {
+                    char c = (char)pending_client.read();
+                    if (c == '\n' || c == '\r') {
+                        if (auth_line_len == 0) continue;
+                        auth_line_buf[auth_line_len] = '\0';
+                        auth_line_len = 0;
+
+                        if (pending_stage == PENDING_AWAIT_PAIR) {
+                            // "PAIR,<64 hex chars>" = the phone's ephemeral X25519 public key
+                            uint8_t phone_pub[32];
+                            unsigned long t0 = millis();
+                            if (strncmp(auth_line_buf, "PAIR,", 5) != 0 ||
+                                !hex_to_bytes(auth_line_buf + 5, strlen(auth_line_buf + 5), phone_pub, sizeof(phone_pub))) {
+                                Serial.println("Security: malformed PAIR response — dropping connection.");
+                                pending_client.stop();
+                                break;
+                            }
+                            if (!pairing_finish(pair_watch_pub, phone_pub, pending_key)) {
+                                Serial.println("Security: invalid phone public key — dropping connection.");
+                                pending_client.stop();
+                                break;
+                            }
+                            Serial.printf("Security: pairing key agreed (%lu ms) — verifying it.\n", millis() - t0);
+                            send_auth_challenge(); // proves both sides derived the same key before it's saved
+                            continue;
+                        }
+
+                        // "AUTH,<64 hex chars>" = HMAC-SHA256(pending_key, auth_nonce), hex-encoded
+                        uint8_t resp_hmac[32];
+                        uint8_t expected[32];
+                        if (strncmp(auth_line_buf, "AUTH,", 5) != 0 ||
+                            !hex_to_bytes(auth_line_buf + 5, strlen(auth_line_buf + 5), resp_hmac, sizeof(resp_hmac))) {
+                            Serial.println("Security: malformed AUTH response — dropping connection.");
+                            pending_client.stop();
+                        } else {
+                            compute_hmac_sha256(pending_key, DEVICE_KEY_LEN, auth_nonce, sizeof(auth_nonce), expected);
+                            if (memcmp(resp_hmac, expected, sizeof(expected)) == 0) {
+                                authenticated = true;
+                                if (pending_is_pairing) {
+                                    save_paired_key(pending_key);
+                                    Serial.println("Security: paired with a new phone.");
+                                }
+                            } else {
+                                // Explicit reply before closing, so the app can tell "key rejected"
+                                // (delete it, re-pair) apart from a Wi-Fi drop (keep it, retry).
+                                pending_client.print("AUTH,FAIL\n");
+                                Serial.println("Security: wrong device key — dropping connection.");
+                                pending_client.stop();
+                            }
+                        }
+                        break; // one response line per handshake — anything after it belongs to the session
+                    } else if (auth_line_len < sizeof(auth_line_buf) - 1) {
+                        auth_line_buf[auth_line_len++] = c;
+                    } else {
+                        Serial.println("Security: AUTH response too long — dropping connection.");
+                        pending_client.stop();
+                        auth_line_len = 0;
+                        break;
+                    }
+                }
+            }
+
+            if (authenticated) {
                 if (client && client.connected()) {
-                    Serial.println("New client connecting — dropping previous (stale) connection.");
+                    Serial.println("Authenticated client replacing previous connection.");
                     client.stop();
                 }
-                client = newClient;
-                client.setNoDelay(true); // send audio chunks immediately, don't batch
+                if (streaming) {
+                    streaming = false;
+                    stop_microphone(); // the previous session's stream shouldn't keep the mic open under the new one
+                }
+                client = pending_client;
+                pending_client = WiFiClient();
+                client.print("AUTH,OK\n");
                 was_connected = true;
                 last_client_seen_millis = millis();
-                streaming = false;
                 connection_start_millis = millis();
                 result_parse_state = RESULT_IDLE; // a previous connection can't leave half-read state behind
                 reminder_rx_active = false;       // ولا نصف جدول تذكيرات يبلع أول بايتات الاتصال الجديد
+                Serial.println("Security: client authenticated.");
                 Serial.println("Client connected.");
             }
-        } else if (!client || !client.connected()) {
+        }
+
+        if (!client || !client.connected()) {
             if (was_connected) {
                 Serial.println("Client disconnected.");
                 was_connected = false;
@@ -2352,14 +3450,19 @@ static void network_task(void *pvParameters)
         phone_connected = last_client_seen_millis != 0 &&
                           (millis() - last_client_seen_millis) < CLIENT_ACTIVITY_TIMEOUT_MS;
 
-        // Mic reads block for ~32ms per chunk while streaming, and write()
-        // can block for up to its 3s timeout if the phone stops draining the
-        // socket — both fine here, since this task has nothing time-critical
-        // to do and, being on its own core, can never stall the UI task even
-        // if it blocks. (A previous version tried to guard the write with
-        // availableForWrite(), but NetworkClient never overrides that — it
-        // always inherits Print's default of 0 — so the guard silently
-        // dropped every chunk, unconditionally. Not doing that again.)
+        // Mic reads block for ~32ms per chunk (fine). client.write() must not
+        // block, though: when the phone vanishes mid-stream (Wi-Fi off), its
+        // retry loop waits up to 10 x 1s for the socket, freezing this whole
+        // task — seen as "network loop stalled 10025 ms" — so auth handshakes
+        // (5s timeout), results and reconnects all go unanswered. So we only
+        // write when select() says the socket can take data now (lwIP reports
+        // writable only with about half its send buffer free, far more than
+        // one 1KB chunk, so the write itself then doesn't wait). Otherwise the
+        // chunk is dropped whole — stale live audio is worthless and dropping
+        // whole chunks keeps the PCM16 sample alignment intact — and after
+        // AUDIO_SEND_STALL_MS with nothing accepted the phone is treated as
+        // gone. (availableForWrite() can't be used for this: NetworkClient
+        // never overrides it, so it always returns 0.)
         if (streaming && client && client.connected()) {
             size_t n = instance.mic.readBytes((char *)audio_buf, CHUNK_SIZE);
             if (!audio_read_started) {
@@ -2368,13 +3471,45 @@ static void network_task(void *pvParameters)
                               (unsigned)CHUNK_SIZE, (unsigned)n);
             }
             if (n > 0) {
-                size_t written = client.write(audio_buf, n);
+                apply_mic_gain(audio_buf, n, MIC_SOFTWARE_GAIN);
+                size_t written = socket_writable_now(client.fd()) ? client.write(audio_buf, n) : 0;
+                if (written == n) {
+                    if (audio_drop_count > 0) {
+                        Serial.printf("Streaming: phone caught up after %lu dropped chunks.\n", audio_drop_count);
+                        audio_drop_count = 0;
+                    }
+                    last_audio_send_ok_ms = millis();
+                } else if (written == 0) {
+                    if (audio_drop_count++ == 0) Serial.println("Streaming: phone not receiving — dropping audio chunks.");
+                    if (millis() - last_audio_send_ok_ms > AUDIO_SEND_STALL_MS) {
+                        Serial.println("Streaming: phone accepted nothing for 3s — dropping the connection.");
+                        client.stop();
+                        streaming = false;
+                        stop_microphone();
+                        audio_drop_count = 0;
+                        continue;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                    continue;
+                }
                 audio_chunks_sent++;
                 audio_bytes_sent += written;
-                if (audio_chunks_sent == 1 || audio_chunks_sent % 100 == 0) {
-                    Serial.printf("Audio packet %lu: mic=%u bytes, tcp_written=%u, total=%lu.\n",
+                if (audio_chunks_sent == 1 || audio_chunks_sent % 16 == 0) {
+                    // مستوى ذروة العينات بعد التضخيم — مو مجرد عدد البايتات —
+                    // عشان نقدر نشوف رقميًا فرق قوة الصوت بين قريب وبعيد أثناء
+                    // الاختبار، بدل ما نخمّن من عدد البايتات (اللي ثابت دايمًا).
+                    // ١٦ حزمة ≈ نص ثانية، يعطي دقة كافية لاختبار قريب/بعيد قصير.
+                    const int16_t *samples = (const int16_t *)audio_buf;
+                    size_t sample_count = n / sizeof(int16_t);
+                    int16_t peak = 0;
+                    for (size_t i = 0; i < sample_count; i++) {
+                        int16_t v = samples[i];
+                        if (v < 0) v = -v;
+                        if (v > peak) peak = v;
+                    }
+                    Serial.printf("Audio packet %lu: mic=%u bytes, tcp_written=%u, total=%lu, peak=%d/32767 (%d%%).\n",
                                   audio_chunks_sent, (unsigned)n, (unsigned)written,
-                                  audio_bytes_sent);
+                                  audio_bytes_sent, peak, (int)(peak * 100L / 32767));
                 }
                 if (audio_chunks_sent == 1 && written == n) {
                     Serial.println("first audio packet sent");
@@ -2447,7 +3582,14 @@ static void check_watch_reminders()
 
 void setup()
 {
+    Serial.setTxBufferSize(4096); // headroom so the zero-timeout setting below only drops logs when nobody's reading
     Serial.begin(115200);
+    // With USB plugged into a computer that isn't reading the port (e.g. just
+    // charging from a laptop), every Serial write otherwise blocks up to ~2s
+    // (20 x 100ms retries in HWCDC) once its buffer fills — enough log volume
+    // freezes network_task and the phone's 5s handshake times out. Logging
+    // must never stall the device: drop output instead of waiting.
+    Serial.setTxTimeoutMs(0);
     delay(300);
 
     instance.begin(); // also sets up instance.mic: PDM, 16kHz, mono, 16-bit
@@ -2478,6 +3620,8 @@ void setup()
     lv_timer_create(update_clock_display_cb, 1000, NULL);
     lv_timer_create(update_wifi_status_display_cb, 300, NULL);
     lv_timer_create(update_connection_status_poll_cb, 500, NULL);
+    lv_timer_create(update_wifi_current_network_display_cb, 1000, NULL);
+    lv_timer_create(update_wifi_scan_result_poll_cb, 300, NULL);
     update_connection_status(); // paint the correct (now real, not-connected-by-default) initial state immediately, don't wait for the first timer tick
 
     instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
@@ -2509,6 +3653,14 @@ void loop()
     if (xQueueReceive(result_queue, &msg, 0) == pdTRUE) {
         show_result_category(msg);
         trigger_vibration(msg.pattern, msg.intensity); // I2C on the same bus as RTC/PMU — UI task only, see result_queue's comment
+    }
+
+    if (pending_vib_test_effect > 0) {
+        int effect = pending_vib_test_effect;
+        pending_vib_test_effect = 0;
+        Serial.printf("Vib test: effect %d\n", effect);
+        instance.setHapticEffects((uint8_t)effect);
+        instance.vibrator();
     }
 
     check_watch_reminders();
