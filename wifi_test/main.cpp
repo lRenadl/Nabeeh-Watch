@@ -70,6 +70,7 @@
  */
 #include <LilyGoLib.h>
 #include <LV_Helper.h>
+#include <Wire.h>           // direct DRV2605 register writes — see haptic_apply_strength()
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
@@ -1265,40 +1266,100 @@ static void show_result_category(const ResultMessage &msg)
     lv_timer_set_repeat_count(alert_return_timer, 1);
 }
 
-// Vibration motor is a DRV2605L haptic driver (I2C, LilyGoLib's
-// instance.setHapticEffects()+instance.vibrator()), not a plain PWM motor —
-// "strength" and "pattern" both have to be picked from its built-in
-// waveform library, not set as a raw number. Effect IDs below are copied
-// from SensorLib's own DRV2605_Basic.ino example (the TI DRV2605L Library 1
-// waveform table), not guessed. Three shapes (نمط) x three intensities
-// (قوة) each, all real, verified table entries:
-//   نمط '1' Strong Click : 100%/60%/30% -> effects 1/2/3
-//   نمط '2' Buzz         : 100%/60%/20% -> effects 47/49/51
-//   نمط '3' Soft Bump    : 100%/60%/30% -> effects 7/8/9
+// Vibration motor is a DRV2605L haptic driver (I2C address 0x5A), not a
+// plain PWM motor. LilyGoLib runs it as an ERM motor in open-loop mode with
+// ROM library 1, and never touches the overdrive-clamp register — so every
+// "100%" ROM effect is capped at the chip's power-on default of
+// OD_CLAMP = 0x8C (≈ 140 × 21.59 mV ≈ 3.0 V), and the old patterns used
+// very short effects (a Strong Click is ~60 ms) at 30–60% levels, which is
+// why the vibration was hard to feel.
+//
+// Two changes make it stronger:
+//  1. HAPTIC_OD_CLAMP raises the peak drive voltage (ERM open loop:
+//     V_peak ≈ OD_CLAMP × 21.59 mV, still limited by the battery voltage).
+//     0xB9 = 185 × 21.59 mV ≈ 4.0 V (chosen because ~3.5 V was still hard
+//     to feel on the wrist). Above ~0xC3 (≈4.2 V) makes no difference — the
+//     chip can't output more than the battery voltage. Lower to 0xA4
+//     (≈3.5 V) or the 0x8C default if the motor sounds harsh — coin ERM
+//     motors are typically rated ~3 V, so 4 V is fine for alerts but
+//     shortens motor life if it buzzes for long stretches.
+//  2. Each alert is now ONE sequence (up to 8 slots) loaded into the
+//     chip's waveform sequencer and started with a single GO — longer
+//     effects (Alert 750ms, Strong Buzz, Triple Click) and the "two bursts
+//     with a gap" feel that tested best, but the gap is a sequencer wait
+//     slot (0x80 | n → n×10 ms) instead of delay(400)+a second vibrator().
+//     That means no second I2C request while a waveform is still playing
+//     (the cause of the old "probe failed" I2C error flood), and the UI
+//     task is no longer blocked for 400 ms.
+// Effect IDs are from the TI DRV2605L ERM Library 1 table (same as
+// SensorLib's drv2605_effect example): 7 Soft Bump 100%, 8 Soft Bump 60%,
+// 10 Double Click 100%, 12 Triple Click 100%, 14 Strong Buzz 100%,
+// 15 Alert 750ms 100%, 47 Buzz 1 100%.
 // MUST only be called from the UI task — see the note on result_queue above.
+#define DRV2605_I2C_ADDR   0x5A
+#define DRV2605_REG_MODE   0x01
+#define DRV2605_REG_SEQ1   0x04 // 0x04..0x0B = 8 waveform-sequence slots
+#define DRV2605_REG_GO     0x0C
+#define DRV2605_REG_CLAMPV 0x17
+#define HAPTIC_OD_CLAMP    0xB9 // ≈4.0 V peak (factory default 0x8C ≈ 3.0 V)
+#define HAPTIC_WAIT(ms10)  (uint8_t)(0x80 | (ms10)) // sequencer pause, units of 10 ms (max 127)
+
+static bool drv2605_write(uint8_t reg, uint8_t value)
+{
+    Wire.beginTransmission(DRV2605_I2C_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+// Re-applied before every vibration (two tiny I2C writes) instead of once
+// in setup(), so it also survives the haptic rail (BLDO2) being switched
+// off and back on by sleep/wake, which resets the chip's registers.
+static void haptic_apply_strength()
+{
+    drv2605_write(DRV2605_REG_MODE, 0x00);           // out of standby, internal trigger
+    drv2605_write(DRV2605_REG_CLAMPV, HAPTIC_OD_CLAMP);
+}
+
+static void haptic_play_sequence(const uint8_t *seq, size_t len)
+{
+    haptic_apply_strength();
+    for (size_t slot = 0; slot < 8; slot++) {
+        drv2605_write(DRV2605_REG_SEQ1 + slot, slot < len ? seq[slot] : 0);
+    }
+    drv2605_write(DRV2605_REG_GO, 1);
+}
+
 static void trigger_vibration(char pattern, char intensity)
 {
-    static const uint8_t click_effects[3]    = {1, 2, 3};
-    static const uint8_t buzz_effects[3]     = {47, 49, 51};
-    static const uint8_t softbump_effects[3] = {7, 8, 9};
+    // قوي/متوسط/خفيف — كل المستويات صارت أقوى من قبل؛ "خفيف" الآن يقارب
+    // "متوسط" القديم، و"قوي" أطول وأعلى جهدًا.
+    static const uint8_t click_strong[] = {12, HAPTIC_WAIT(25), 12, HAPTIC_WAIT(25), 12}; // 3× Triple Click
+    static const uint8_t click_medium[] = {12, HAPTIC_WAIT(30), 12};
+    static const uint8_t click_light[]  = {10, HAPTIC_WAIT(30), 10};                      // Double Click
 
-    int idx = (intensity == '1') ? 0 : (intensity == '2') ? 1 : 2; // قوي/متوسط/خفيف
-    uint8_t effect;
+    static const uint8_t buzz_strong[]  = {15, HAPTIC_WAIT(30), 15};                      // 2× Alert 750ms
+    static const uint8_t buzz_medium[]  = {14, 14, HAPTIC_WAIT(30), 14, 14};              // Strong Buzz
+    static const uint8_t buzz_light[]   = {47, HAPTIC_WAIT(30), 47};                      // Buzz 1 100%
+
+    static const uint8_t bump_strong[]  = {7, 7, 7, HAPTIC_WAIT(30), 7, 7, 7};            // Soft Bump 100%
+    static const uint8_t bump_medium[]  = {7, 7, HAPTIC_WAIT(30), 7, 7};
+    static const uint8_t bump_light[]   = {8, 8, HAPTIC_WAIT(30), 8, 8};                  // Soft Bump 60%
+
+    const int idx = (intensity == '1') ? 0 : (intensity == '2') ? 1 : 2;
+    const uint8_t *seq;
+    size_t len;
+#define PICK(s, m, l) do { if (idx == 0) { seq = s; len = sizeof(s); } \
+                           else if (idx == 1) { seq = m; len = sizeof(m); } \
+                           else { seq = l; len = sizeof(l); } } while (0)
     switch (pattern) {
-        case '1': effect = click_effects[idx]; break;
-        case '2': effect = buzz_effects[idx]; break;
-        case '3': effect = softbump_effects[idx]; break;
+        case '1': PICK(click_strong, click_medium, click_light); break;
+        case '2': PICK(buzz_strong,  buzz_medium,  buzz_light);  break;
+        case '3': PICK(bump_strong,  bump_medium,  bump_light);  break;
         default: return;
     }
-    instance.setHapticEffects(effect);
-    // يكرر نفس التأثير مرتين بفاصل ٤٠٠ms — جُرّب بمقارنة مباشرة مع ٣ تكرارات
-    // وفُضّل عليها (الإحساس التراكمي بمرتين كان أوضح فعليًا من ٣). محاولة
-    // سابقة بفاصل قصير (150ms) سبّبت طوفان أخطاء I2C ("probe failed")
-    // متلاحقة لأن الموجة السابقة ما كانت تخلص تشغيلها فعليًا قبل الطلب
-    // الجديد؛ ٤٠٠ms مؤكد آمن (صفر أخطاء بعدة اختبارات فعلية).
-    instance.vibrator();
-    delay(400);
-    instance.vibrator();
+#undef PICK
+    haptic_play_sequence(seq, len);
 }
 
 // اسم التذكير المطابق للدقيقة الحالية. لازم لأن تنبيه '#T' الجاي من الجوال
@@ -2522,54 +2583,55 @@ static const uint16_t TCP_PORT = 3333;
 static const char *MDNS_HOSTNAME = "nabeeh-watch";
 static const size_t CHUNK_SIZE = 1024; // 512 samples @ 16-bit = ~32ms of audio per chunk
 
-// The T-Watch S3's built-in PDM mic reads quiet by default — normal-distance
-// and close-up sounds (e.g. a knock right at the wrist) come in as low-
-// amplitude PCM that the classifier model sees as near-silence. LilyGoLib's
-// mic wrapper doesn't expose a hardware gain register for the PDM peripheral,
-// so we amplify digitally here instead: multiply every 16-bit sample by
-// MIC_SOFTWARE_GAIN and hard-clip to the int16 range (rather than letting it
-// wrap around, which would turn loud sounds into harsh digital noise).
-// Start around 4x and raise/lower after listening to captured audio — too
-// high and the noise floor gets amplified into audible hiss and true loud
-// sounds clip; too low and quiet/near sounds are still missed.
+// Mic processing before audio goes to the phone/API.
+//
+// DC-offset removal — REQUIRED for the classifier, not optional. This PDM mic
+// outputs a constant DC bias (~5% of full scale, measured earlier). The API
+// (same preprocessing as Nabeeh_Model_v2's preprocess_waveform) loudness-
+// normalizes every 3 s chunk to -20 LUFS; the LUFS meter's K-weighting
+// ignores DC, but the gain it applies multiplies the DC too — a quiet chunk
+// gets boosted ~100x, the bias blows past full scale, np.clip(-1, 1) flattens
+// the waveform, and YAMNet sees clipped clicks (which look like knocks). The
+// bias also keeps silent chunks above the API's min_rms "too quiet" gate.
+// Tested: removing this filter made far sounds disappear and caused random
+// false "knock" results.
+// One-pole DC-blocking high-pass: y[n] = x[n] - x[n-1] + R*y[n-1], cutoff
+// ≈ (1-R)·fs/2π ≈ 13 Hz — removes the bias, leaves every class's audio alone.
+//
+// Software gain ×6 (1.0 = off). The API rescales loudness anyway, so gain
+// mainly helps quiet/far sounds pass its min_rms (0.003) gate — tested:
+// without it, sounds from across the room stopped being detected. Side
+// effect: it also lifts the quiet-room noise floor over that gate, and the
+// API then normalizes plain hiss up to -20 LUFS, which can come out as a
+// false "fire_alarm" (its threshold is set low for recall). Samples are
+// hard-clipped to int16 so loud sounds clip instead of wrapping.
 #define MIC_SOFTWARE_GAIN 6.0f
-// Peak-level testing at gain=4 and gain=10 both showed a suspiciously
-// steady "floor" that scaled exactly with the gain multiplier (~20% at 4x,
-// ~50% at 10x) even during total silence/distance — a real noise floor
-// fluctuates sample to sample, it doesn't sit dead flat. That's the
-// signature of a constant DC bias in the PDM demodulator's output, not
-// random self-noise, and gain alone can never separate real signal from a
-// bias that scales right along with it. A one-pole DC-blocking high-pass
-// filter (standard technique: y[n] = x[n] - x[n-1] + R*y[n-1]) removes a
-// constant offset entirely while passing speech/crying-range frequencies
-// through basically unaffected, so gain afterward amplifies only the real,
-// varying part of the signal.
-static void remove_dc_offset(int16_t *samples, size_t sample_count)
+
+static float dc_prev_x = 0.0f;
+static float dc_prev_y = 0.0f;
+
+// Called whenever the mic (re)starts, so a new stream doesn't begin with a
+// transient left over from the previous session's filter state.
+static void reset_dc_filter()
 {
-    static float prev_x = 0.0f;
-    static float prev_y = 0.0f;
-    const float R = 0.995f; // pole near 1 -> very low cutoff, keeps everything above a few Hz
-    for (size_t i = 0; i < sample_count; i++) {
-        float x = (float)samples[i];
-        float y = x - prev_x + R * prev_y;
-        prev_x = x;
-        prev_y = y;
-        if (y > 32767.0f) y = 32767.0f;
-        else if (y < -32768.0f) y = -32768.0f;
-        samples[i] = (int16_t)y;
-    }
+    dc_prev_x = 0.0f;
+    dc_prev_y = 0.0f;
 }
 
-static void apply_mic_gain(uint8_t *buf, size_t byte_count, float gain)
+static void process_mic_audio(uint8_t *buf, size_t byte_count)
 {
     int16_t *samples = (int16_t *)buf;
-    size_t sample_count = byte_count / sizeof(int16_t);
-    remove_dc_offset(samples, sample_count);
+    const size_t sample_count = byte_count / sizeof(int16_t);
+    const float R = 0.995f;
     for (size_t i = 0; i < sample_count; i++) {
-        int32_t amplified = (int32_t)(samples[i] * gain);
-        if (amplified > INT16_MAX) amplified = INT16_MAX;
-        else if (amplified < INT16_MIN) amplified = INT16_MIN;
-        samples[i] = (int16_t)amplified;
+        const float x = (float)samples[i];
+        const float y = x - dc_prev_x + R * dc_prev_y;
+        dc_prev_x = x;
+        dc_prev_y = y;
+        float out = y * MIC_SOFTWARE_GAIN;
+        if (out > 32767.0f) out = 32767.0f;
+        else if (out < -32768.0f) out = -32768.0f;
+        samples[i] = (int16_t)out;
     }
 }
 
@@ -2685,6 +2747,7 @@ static bool start_microphone()
 {
     if (microphone_active) return true;
 
+    reset_dc_filter();
     instance.mic.setPinsPdmRx(MIC_SCK, MIC_DAT);
     microphone_active = instance.mic.begin(
         I2S_MODE_PDM_RX,
@@ -3471,7 +3534,7 @@ static void network_task(void *pvParameters)
                               (unsigned)CHUNK_SIZE, (unsigned)n);
             }
             if (n > 0) {
-                apply_mic_gain(audio_buf, n, MIC_SOFTWARE_GAIN);
+                process_mic_audio(audio_buf, n); // DC filter (+ gain if MIC_SOFTWARE_GAIN != 1)
                 size_t written = socket_writable_now(client.fd()) ? client.write(audio_buf, n) : 0;
                 if (written == n) {
                     if (audio_drop_count > 0) {
@@ -3495,7 +3558,7 @@ static void network_task(void *pvParameters)
                 audio_chunks_sent++;
                 audio_bytes_sent += written;
                 if (audio_chunks_sent == 1 || audio_chunks_sent % 16 == 0) {
-                    // مستوى ذروة العينات بعد التضخيم — مو مجرد عدد البايتات —
+                    // مستوى ذروة العينات بعد فلتر DC (والتضخيم لو مفعّل) — مو مجرد عدد البايتات —
                     // عشان نقدر نشوف رقميًا فرق قوة الصوت بين قريب وبعيد أثناء
                     // الاختبار، بدل ما نخمّن من عدد البايتات (اللي ثابت دايمًا).
                     // ١٦ حزمة ≈ نص ثانية، يعطي دقة كافية لاختبار قريب/بعيد قصير.
@@ -3658,9 +3721,9 @@ void loop()
     if (pending_vib_test_effect > 0) {
         int effect = pending_vib_test_effect;
         pending_vib_test_effect = 0;
-        Serial.printf("Vib test: effect %d\n", effect);
-        instance.setHapticEffects((uint8_t)effect);
-        instance.vibrator();
+        Serial.printf("Vib test: effect %d (clamp 0x%02X)\n", effect, HAPTIC_OD_CLAMP);
+        const uint8_t one[] = {(uint8_t)effect};
+        haptic_play_sequence(one, 1); // same raised drive voltage as real alerts
     }
 
     check_watch_reminders();
