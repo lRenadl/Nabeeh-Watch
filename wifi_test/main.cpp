@@ -62,6 +62,14 @@
  *                   command to run when a reminder didn't fire.
  *     '!'        -> fire a test reminder immediately, ignoring the clock and
  *                   the duplicate-suppression window.
+ *     'b' + digits + '\n'
+ *                -> testing only: pretend the battery is at that percent
+ *                   ("b15\n"), for both the low-battery alert and the 'i'
+ *                   status reply, so the whole watch+phone alert can be
+ *                   tested without draining the battery. "b\n" goes back to
+ *                   the real reading. Not persisted — a reboot clears it.
+ *   The watch also raises '#L' (شحن منخفض) by itself when its own battery
+ *   drops to LOW_BATTERY_ALERT_PCT — no phone involved.
  * Same commands work over USB Serial too (dev/testing convenience) — e.g.
  * typing "#B" in the Serial Monitor simulates a "باكاء أطفال" result
  * without needing the phone to send anything for real.
@@ -123,7 +131,9 @@ static void arabic_digits(int n, char *out)
 }
 
 struct AlertCategory {
-    const lv_image_dsc_t *icon;
+    // صورة (lv_image_dsc_t) أو رمز LVGL نصي (مثل LV_SYMBOL_BATTERY_EMPTY) —
+    // lv_image_set_src يقبل الاثنين.
+    const void *icon;
     const lv_image_dsc_t *sign_gif;
     const char *label;
 };
@@ -139,6 +149,8 @@ static const AlertCategory alert_categories[] = {
     // sign_gif=nullptr، مع تعديل show_sign_result أدناه ليتجاهل وضع لغة
     // الإشارة ويرجع لعرض الأيقونة+النص العادي كلما كان sign_gif فاضي.
     {&emoji_bell,   nullptr,        "تذكير"},
+    // ما فيه صورة بطارية جاهزة — نستخدم رمز البطارية من خط LVGL نفسه.
+    {LV_SYMBOL_BATTERY_EMPTY, nullptr, "شحن الساعة منخفض"},
 };
 #define ALERT_CATEGORY_COUNT (sizeof(alert_categories) / sizeof(alert_categories[0]))
 
@@ -154,6 +166,7 @@ static const ResultCode result_codes[] = {
     {'F', 3}, // إنذار حريق
     {'A', 4}, // الأذان
     {'T', 5}, // تذكير — من ميزة المنبّهات بالتطبيق، مو من تصنيف صوت
+    {'L', 6}, // شحن منخفض — الساعة تطلقه بنفسها (check_low_battery)
 };
 #define RESULT_CODE_COUNT (sizeof(result_codes) / sizeof(result_codes[0]))
 
@@ -181,12 +194,36 @@ struct WatchReminder {
 };
 // فهرس فئة "تذكير" داخل alert_categories، مأخوذ من نفس جدول الأكواد بدل ما
 // يُكتب رقمًا ثابتًا هنا — عشان إضافة فئة جديدة فوق ما تكسره بصمت.
-static int reminder_category_index()
+static int category_index_for_code(char code)
 {
     for (size_t i = 0; i < RESULT_CODE_COUNT; i++) {
-        if (result_codes[i].code == 'T') return result_codes[i].category_index;
+        if (result_codes[i].code == code) return result_codes[i].category_index;
     }
     return -1;
+}
+static int reminder_category_index() { return category_index_for_code('T'); }
+static int low_battery_category_index() { return category_index_for_code('L'); }
+
+// ── تنبيه الشحن المنخفض ─────────────────────────────────────────────────────
+// الساعة تنبّه بنفسها مرة وحدة لما تنزل لـ٢٠٪ (حتى لو الجوال مو متصل)، وما
+// ترجع تنبّه إلا بعد ما تنشحن لـ٢٥٪ أو تنحط على الشاحن — عشان التذبذب حول
+// ٢٠٪ ما يكرر التنبيه. التطبيق يقرا نفس النسبة من 'i' وينبّه بالجوال.
+#define LOW_BATTERY_ALERT_PCT 20
+#define LOW_BATTERY_REARM_PCT 25
+// -2 = القراءة الحقيقية. غير كذا: نسبة مفروضة للاختبار عبر "b15\n".
+static volatile int battery_override_pct = -2;
+// يصفّر عشان القراءة الجاية تصير فورًا (بدل ما ننتظر لين ٣٠ ثانية).
+static volatile int batt_poll_countdown = 0;
+
+static int read_battery_percent()
+{
+    const int o = battery_override_pct;
+    return o >= -1 ? o : instance.pmu.getBatteryPercent();
+}
+
+static bool read_is_charging()
+{
+    return battery_override_pct >= -1 ? false : instance.pmu.isCharging();
 }
 
 // تشخيص: سطر لكل دقيقة يوضح وقت الساعة واليوم وعدد التذكيرات المخزّنة.
@@ -973,6 +1010,28 @@ struct RtcSnapshot {
 };
 static RtcSnapshot rtc_snapshot = {0, 0, 0, 0, 0, false};
 
+static void handle_result_code(char code, char pattern, char intensity, const char *source,
+                               const char *label = nullptr); // defined further down
+
+// UI task only (من update_clock_display_cb) — يمر عبر نفس طابور التنبيهات.
+static void check_low_battery(int pct, bool charging)
+{
+    static bool alerted = false;
+    if (pct < 0) return; // غير متوفرة
+    if (alerted) {
+        if (pct >= LOW_BATTERY_REARM_PCT || charging) {
+            alerted = false;
+            Serial.printf("Battery: %d%%%s — re-armed low-battery alert\n", pct, charging ? " (charging)" : "");
+        }
+        return;
+    }
+    if (!charging && pct <= LOW_BATTERY_ALERT_PCT) {
+        alerted = true;
+        Serial.printf("Battery: %d%% — low-battery alert\n", pct);
+        handle_result_code('L', '2', '1', "battery"); // اهتزاز طويل قوي
+    }
+}
+
 static void update_clock_display_cb(lv_timer_t *t)
 {
     RTC_DateTime now = instance.rtc.getDateTime();
@@ -1009,14 +1068,15 @@ static void update_clock_display_cb(lv_timer_t *t)
     // The battery is worth polling far less often than the clock: the reading
     // moves slowly and it's a second I2C transaction on top of the RTC read
     // above. Keep it on roughly the original 30s cadence.
-    static int batt_poll_countdown = 0;
     if (batt_poll_countdown > 0) {
         batt_poll_countdown--;
         return;
     }
     batt_poll_countdown = 30;
 
-    int batt_pct = instance.pmu.getBatteryPercent();
+    int batt_pct = read_battery_percent();
+    const bool charging = read_is_charging();
+    check_low_battery(batt_pct, charging);
     if (batt_pct >= 0) {
         char pct_buf[8];
         snprintf(pct_buf, sizeof(pct_buf), "%d%%", batt_pct);
@@ -1026,7 +1086,7 @@ static void update_clock_display_cb(lv_timer_t *t)
         batt_pct = 0;
     }
 
-    if (instance.pmu.isCharging()) {
+    if (charging) {
         lv_label_set_text(batt_icon_label, LV_SYMBOL_CHARGE);
     } else if (batt_pct >= 90) {
         lv_label_set_text(batt_icon_label, LV_SYMBOL_BATTERY_FULL);
@@ -1100,6 +1160,9 @@ static void build_alert_screen()
     lv_obj_center(icon_bg);
 
     alert_icon_img = lv_image_create(alert_screen);
+    // تنطبق بس لما المصدر رمز نصي (أيقونة البطارية)، الصور ما تتأثر.
+    lv_obj_set_style_text_font(alert_icon_img, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(alert_icon_img, lv_color_hex(0xFF5A5A), 0);
     lv_obj_center(alert_icon_img);
 
     alert_category_lbl = lv_label_create(alert_screen);
@@ -1259,7 +1322,9 @@ static void show_result_category(const ResultMessage &msg)
     if (alert_return_timer) {
         lv_timer_delete(alert_return_timer);
     }
-    uint32_t hold_ms = (category_index == reminder_category_index())
+    // الشحن المنخفض زي التذكير: مو لحظي، فيقعد على الشاشة دقيقة.
+    uint32_t hold_ms = (category_index == reminder_category_index() ||
+                        category_index == low_battery_category_index())
                            ? REMINDER_AUTO_RETURN_MS
                            : ALERT_AUTO_RETURN_MS;
     alert_return_timer = lv_timer_create(alert_return_timeout_cb, hold_ms, NULL);
@@ -1387,7 +1452,7 @@ static const char *lookup_reminder_label_for_now()
 // Serial on the UI task for testing) — safe to call from either, since it
 // only ever queues a message rather than acting on it directly.
 static void handle_result_code(char code, char pattern, char intensity, const char *source,
-                               const char *label = nullptr)
+                               const char *label)
 {
     // التذكير له مصدرين مقصودين (ساعة الساعة نفسها، والجوال لو كان صاحيًا) —
     // نكتم الثاني عشان المستخدم ما يحس باهتزازين لنفس التذكير. يخص 'T' فقط:
@@ -2005,6 +2070,9 @@ static volatile bool wifi_saved_list_needs_refresh = false;
 static volatile int pending_vib_test_effect = 0; // 0 = لا يوجد طلب معلّق
 static bool vib_test_rx_active = false;
 static char vib_test_buf[8];
+static bool battery_test_rx_active = false;
+static char battery_test_buf[4];
+static size_t battery_test_len = 0;
 static size_t vib_test_len = 0;
 // Set by the toast's close (X) button (UI task); network_task tears down
 // whichever provisioning method is actually running (or about to start)
@@ -2810,6 +2878,34 @@ static void handle_incoming_byte(char c, const char *source)
         return;
     }
 
+    if (battery_test_rx_active) {
+        if (c == '\n' || c == '\r') {
+            battery_test_buf[battery_test_len] = '\0';
+            battery_test_rx_active = false;
+            if (battery_test_len == 0) {
+                battery_override_pct = -2;
+                Serial.printf("Battery test (%s): back to the real reading\n", source);
+            } else {
+                int pct = atoi(battery_test_buf);
+                if (pct > 100) pct = 100;
+                battery_override_pct = pct;
+                Serial.printf("Battery test (%s): pretending battery is %d%%\n", source, pct);
+            }
+            batt_poll_countdown = 0; // نطبّقها بالقراءة الجاية فورًا
+            return;
+        } else if (isdigit((unsigned char)c) && battery_test_len < sizeof(battery_test_buf) - 1) {
+            battery_test_buf[battery_test_len++] = c;
+            return;
+        } else {
+            battery_test_rx_active = false; // بايت غلط — نلغي ونكمل تحت كأمر عادي
+        }
+    }
+    if (c == 'b') {
+        battery_test_rx_active = true;
+        battery_test_len = 0;
+        return;
+    }
+
     if (reminder_rx_active) {
         if (millis() - reminder_rx_started > REMINDER_RX_TIMEOUT_MS) {
             Serial.printf("Reminders (%s): انتهت مهلة الاستقبال — إلغاء\n", source);
@@ -2904,7 +3000,7 @@ static void handle_incoming_byte(char c, const char *source)
                       source, audio_chunks_sent, audio_bytes_sent);
     } else if (c == 'i' || c == 'I') {
         Serial.printf("command received: %c\n", c);
-        int battery = instance.pmu.getBatteryPercent(); // -1 if unavailable (e.g. no battery connected)
+        int battery = read_battery_percent(); // -1 if unavailable (e.g. no battery connected)
         unsigned long sync_ago_sec;
         if (client && client.connected()) {
             sync_ago_sec = (millis() - connection_start_millis) / 1000; // how long this session has been up
