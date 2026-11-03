@@ -768,71 +768,125 @@ static void close_confirm_modal_cb(lv_event_t *e)
     }
 }
 
+// نافذة تأكيد موحّدة لأي إجراء حسّاس: أيقونة + عنوان + شرح قصير + زرين
+// كبار فوق بعض (الإجراء ثم "تراجع") — كبار ومتباعدين عشان ما ينضغط الغلط.
+typedef void (*confirm_action_fn)();
+static confirm_action_fn pending_confirm_action = nullptr;
+
+static void confirm_modal_yes_cb(lv_event_t *e)
+{
+    confirm_action_fn action = pending_confirm_action;
+    pending_confirm_action = nullptr;
+    close_confirm_modal_cb(e);
+    if (action) action();
+}
+
+static lv_obj_t *make_modal_button(lv_obj_t *parent, const char *text, bool filled,
+                                   lv_color_t color, lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, lv_pct(100), 42);
+    lv_obj_set_style_radius(btn, 12, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    if (filled) {
+        lv_obj_set_style_bg_color(btn, color, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_70, LV_STATE_PRESSED);
+    } else {
+        lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_10, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_STATE_PRESSED);
+    }
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void show_confirm_modal(const char *symbol, lv_color_t accent, const char *title,
+                               const char *message, const char *confirm_text,
+                               confirm_action_fn action)
+{
+    if (confirm_modal_overlay) return; // نافذة وحدة بس، حتى لو انضغط الزر مرتين
+    pending_confirm_action = action;
+
+    // الطبقة الخلفية clickable (افتراضيًا) فتمتص أي لمسة برا البطاقة بدل ما
+    // توصل للأزرار اللي تحتها.
+    confirm_modal_overlay = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(confirm_modal_overlay);
+    lv_obj_add_flag(confirm_modal_overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(confirm_modal_overlay, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(confirm_modal_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(confirm_modal_overlay, LV_OPA_70, 0);
+    lv_obj_align(confirm_modal_overlay, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *card = lv_obj_create(confirm_modal_overlay);
+    lv_obj_set_size(card, lv_pct(92), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, COLOR_PRIMARY, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_border_color(card, accent, 0);
+    lv_obj_set_style_border_opa(card, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    lv_obj_center(card);
+
+    // عنوان مع أيقونة بنفس السطر
+    lv_obj_t *title_row = lv_obj_create(card);
+    lv_obj_remove_style_all(title_row);
+    lv_obj_set_size(title_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW_REVERSE);
+    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(title_row, 8, 0);
+
+    lv_obj_t *icon = lv_label_create(title_row);
+    lv_label_set_text(icon, symbol);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(icon, accent, 0);
+
+    lv_obj_t *title_lbl = lv_label_create(title_row);
+    lv_label_set_text(title_lbl, title);
+    lv_obj_set_style_text_font(title_lbl, &tajawal_bold_24, 0);
+    lv_obj_set_style_text_color(title_lbl, COLOR_TEXT, 0);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg, message);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(msg, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(msg, COLOR_MUTED, 0);
+    lv_obj_set_width(msg, lv_pct(100));
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_margin_bottom(msg, 4, 0);
+
+    make_modal_button(card, confirm_text, true, accent, confirm_modal_yes_cb);
+    lv_obj_t *no_btn = make_modal_button(card, "تراجع", false, COLOR_TEXT, close_confirm_modal_cb);
+    lv_obj_set_style_margin_top(no_btn, 2, 0);
+}
+
 // Replaces the old "فصل الساعة عن الجوال", which only closed the socket: with
 // the app holding a persistent connection it reconnected within ~2s, so the
 // button did nothing visible — and a disconnect that *stayed* disconnected
 // would silently cut off sound alerts for a deaf user. Unpairing is the thing
 // the button actually meant: this phone can't reconnect until it pairs again.
-static void confirm_unpair_cb(lv_event_t *e)
+static void do_unpair_phone()
 {
     security_reset_requested = true;
-    close_confirm_modal_cb(e);
 }
 
 static void show_unpair_confirm_cb(lv_event_t *e)
 {
-    lv_obj_t *parent = lv_screen_active();
-
-    confirm_modal_overlay = lv_obj_create(parent);
-    lv_obj_remove_style_all(confirm_modal_overlay);
-    lv_obj_set_size(confirm_modal_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(confirm_modal_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(confirm_modal_overlay, LV_OPA_60, 0);
-    lv_obj_center(confirm_modal_overlay);
-
-    lv_obj_t *card = lv_obj_create(confirm_modal_overlay);
-    lv_obj_set_size(card, lv_pct(85), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(card, COLOR_PRIMARY, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(card, 12, 0);
-    lv_obj_center(card);
-
-    lv_obj_t *question = lv_label_create(card);
-    lv_label_set_text(question, "إلغاء ارتباط الهاتف؟ لازم تربطين التطبيق من جديد بعدها.");
-    lv_obj_set_style_text_font(question, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(question, COLOR_TEXT, 0);
-    lv_obj_set_width(question, lv_pct(100));
-    lv_obj_set_style_text_align(question, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_obj_t *yes_btn = lv_button_create(card);
-    lv_obj_set_size(yes_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_color(yes_btn, COLOR_DISCONNECTED, 0);
-    lv_obj_set_style_bg_opa(yes_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(yes_btn, 10, 0);
-    lv_obj_add_event_cb(yes_btn, confirm_unpair_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
-    lv_label_set_text(yes_lbl, "نعم، ألغِ الارتباط");
-    lv_obj_set_style_text_font(yes_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
-    lv_obj_center(yes_lbl);
-
-    lv_obj_t *no_btn = lv_button_create(card);
-    lv_obj_set_size(no_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(no_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(no_btn, lv_color_white(), 0);
-    lv_obj_set_style_border_opa(no_btn, LV_OPA_40, 0);
-    lv_obj_set_style_border_width(no_btn, 1, 0);
-    lv_obj_set_style_radius(no_btn, 10, 0);
-    lv_obj_add_event_cb(no_btn, close_confirm_modal_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *no_lbl = lv_label_create(no_btn);
-    lv_label_set_text(no_lbl, "لا");
-    lv_obj_set_style_text_font(no_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(no_lbl, COLOR_TEXT, 0);
-    lv_obj_center(no_lbl);
+    LV_UNUSED(e);
+    show_confirm_modal(LV_SYMBOL_WARNING, COLOR_DISCONNECTED,
+                       "إلغاء الارتباط؟",
+                       "ستتوقف التنبيهات حتى تعيد ربط الساعة بالتطبيق.",
+                       "إلغاء ارتباط الهاتف", do_unpair_phone);
 }
 
 static void splash_timeout_cb(lv_timer_t *t)
@@ -846,9 +900,21 @@ static void restart_watch_cb(lv_event_t *e)
     // A real ESP.restart() froze the panel on this hardware (a software
     // reset doesn't cleanly re-init the display the way a power-on/hard
     // reset does), so this "restart" just replays the boot UI flow instead.
+    LV_UNUSED(e);
     lv_screen_load_anim(splash_screen, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, false);
     lv_timer_t *t = lv_timer_create(splash_timeout_cb, 4000, NULL);
     lv_timer_set_repeat_count(t, 1);
+}
+
+static void do_restart_watch() { restart_watch_cb(nullptr); }
+
+static void show_restart_confirm_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    show_confirm_modal(LV_SYMBOL_REFRESH, lv_color_hex(0x1773CF),
+                       "إعادة التشغيل؟",
+                       "ستعود الساعة إلى شاشة البداية خلال ثوانٍ.",
+                       "إعادة تشغيل الساعة", do_restart_watch);
 }
 
 static void choose_sign_language_cb(lv_event_t *e)
@@ -1494,6 +1560,39 @@ static void handle_result_code(char code, char pattern, char intensity, const ch
     Serial.printf("Result (%s): unknown category code '%c'\n", source, code);
 }
 
+// زر إعدادات كبير (٤٦px) بأيقونة ونص بالنص — أكبر من قبل (٣٦px) ومعه لون
+// ضغط واضح، عشان اللمسة تنضغط على الزر المقصود من أول مرة.
+static lv_obj_t *make_settings_button(lv_obj_t *parent, const char *symbol, const char *text,
+                                      lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, lv_pct(100), 46);
+    lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_10, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(btn, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_radius(btn, 12, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_hor(btn, 14, 0);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW_REVERSE);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn, 10, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *icon = lv_label_create(btn);
+    lv_label_set_text(icon, symbol);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MUTED, 0);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
+    return btn;
+}
+
 static void build_settings_screen()
 {
     settings_screen = make_screen();
@@ -1525,14 +1624,20 @@ static void build_settings_screen()
     lv_obj_set_style_text_color(title, COLOR_TEXT, 0);
     lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_LEFT_MID, -6, 0);
 
-    // everything below the header sits in one flex column with consistent gaps
+    // كل اللي تحت العنوان بعمود وحده بمساحته الخاصة (تحت العنوان لين آخر
+    // الشاشة) ويتمرّر لحاله — المحتوى أطول من الشاشة، والعنوان يبقى ثابت.
     lv_obj_t *content = lv_obj_create(settings_screen);
     lv_obj_remove_style_all(content);
     lv_obj_remove_flag(content, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_size(content, lv_pct(100), LV_VER_RES - 24 /* حشوة الشاشة */ - 28 - 8);
     lv_obj_align_to(content, header, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(content, 10, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_set_style_pad_bottom(content, 8, 0);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
+    // ما يتمرّر الشاشة كلها مع المحتوى (كان يخلّي الأزرار تتحرك تحت الإصبع)
+    lv_obj_remove_flag(settings_screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // section label
     lv_obj_t *section = lv_label_create(content);
@@ -1587,50 +1692,12 @@ static void build_settings_screen()
         select_segment(seg_text_btn, seg_text_lbl_ref, seg_sign_btn, seg_sign_lbl_ref);
     }
 
-    // action buttons
-    lv_obj_t *unpair_btn = lv_button_create(content);
-    lv_obj_set_size(unpair_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(unpair_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(unpair_btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_border_opa(unpair_btn, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(unpair_btn, 1, 0);
-    lv_obj_set_style_radius(unpair_btn, 10, 0);
-    lv_obj_set_style_margin_top(unpair_btn, 6, 0);
-    lv_obj_add_event_cb(unpair_btn, show_unpair_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *unpair_lbl = lv_label_create(unpair_btn);
-    lv_label_set_text(unpair_lbl, "إلغاء ارتباط الهاتف");
-    lv_obj_set_style_text_font(unpair_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(unpair_lbl, COLOR_TEXT, 0);
-    lv_obj_center(unpair_lbl);
-
-    lv_obj_t *restart_btn = lv_button_create(content);
-    lv_obj_set_size(restart_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(restart_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(restart_btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_border_opa(restart_btn, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(restart_btn, 1, 0);
-    lv_obj_set_style_radius(restart_btn, 10, 0);
-    lv_obj_add_event_cb(restart_btn, restart_watch_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *restart_lbl = lv_label_create(restart_btn);
-    lv_label_set_text(restart_lbl, "إعادة تشغيل الساعة");
-    lv_obj_set_style_text_font(restart_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(restart_lbl, COLOR_TEXT, 0);
-    lv_obj_center(restart_lbl);
-
-    lv_obj_t *change_wifi_btn = lv_button_create(content);
-    lv_obj_set_size(change_wifi_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(change_wifi_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(change_wifi_btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_border_opa(change_wifi_btn, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(change_wifi_btn, 1, 0);
-    lv_obj_set_style_radius(change_wifi_btn, 10, 0);
-    lv_obj_add_event_cb(change_wifi_btn, go_to_wifi_settings_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *change_wifi_lbl = lv_label_create(change_wifi_btn);
-    lv_label_set_text(change_wifi_lbl, "شبكة الواي فاي");
-    lv_obj_set_style_text_font(change_wifi_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(change_wifi_lbl, COLOR_TEXT, 0);
-    lv_obj_center(change_wifi_lbl);
-
+    // action buttons — الترتيب: الواي فاي، إلغاء الارتباط، إعادة التشغيل
+    lv_obj_t *wifi_btn = make_settings_button(content, LV_SYMBOL_WIFI, "شبكة الواي فاي",
+                                              go_to_wifi_settings_cb);
+    lv_obj_set_style_margin_top(wifi_btn, 4, 0);
+    make_settings_button(content, LV_SYMBOL_CLOSE, "إلغاء ارتباط الهاتف", show_unpair_confirm_cb);
+    make_settings_button(content, LV_SYMBOL_REFRESH, "إعادة تشغيل الساعة", show_restart_confirm_cb);
 }
 
 // يعيد بناء صفوف الشبكات المحفوظة داخل wifi_saved_list من saved_networks[]
