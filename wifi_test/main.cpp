@@ -205,10 +205,12 @@ static int reminder_category_index() { return category_index_for_code('T'); }
 static int low_battery_category_index() { return category_index_for_code('L'); }
 
 // ── تنبيه الشحن المنخفض ─────────────────────────────────────────────────────
-// الساعة تنبّه بنفسها مرة وحدة لما تنزل لـ٢٠٪ (حتى لو الجوال مو متصل)، وما
-// ترجع تنبّه إلا بعد ما تنشحن لـ٢٥٪ أو تنحط على الشاحن — عشان التذبذب حول
-// ٢٠٪ ما يكرر التنبيه. التطبيق يقرا نفس النسبة من 'i' وينبّه بالجوال.
+// الساعة تنبّه بنفسها (حتى لو الجوال مو متصل) مرة عند ٢٠٪ ومرة ثانية أوضح
+// عند ١٠٪، وما ترجع تنبّه إلا بعد ما تنشحن لـ٢٥٪ أو تنحط على الشاحن — عشان
+// التذبذب حول الحد ما يكرر التنبيه. التطبيق يقرا نفس النسبة من 'i' وينبّه
+// بالجوال على نفس المرحلتين.
 #define LOW_BATTERY_ALERT_PCT 20
+#define CRITICAL_BATTERY_ALERT_PCT 10
 #define LOW_BATTERY_REARM_PCT 25
 // -2 = القراءة الحقيقية. غير كذا: نسبة مفروضة للاختبار عبر "b15\n".
 static volatile int battery_override_pct = -2;
@@ -1081,20 +1083,30 @@ static void handle_result_code(char code, char pattern, char intensity, const ch
 // UI task only (من update_clock_display_cb) — يمر عبر نفس طابور التنبيهات.
 static void check_low_battery(int pct, bool charging)
 {
-    static bool alerted = false;
+    // أدنى حد نبّهنا عليه: 101 = ما نبّهنا، 20 = نبّهنا عند ٢٠٪، 10 = عند ١٠٪
+    static int alerted_at = 101;
     if (pct < 0) return; // غير متوفرة
-    if (alerted) {
-        if (pct >= LOW_BATTERY_REARM_PCT || charging) {
-            alerted = false;
+    if (pct >= LOW_BATTERY_REARM_PCT || charging) {
+        if (alerted_at <= 100) {
+            alerted_at = 101;
             Serial.printf("Battery: %d%%%s — re-armed low-battery alert\n", pct, charging ? " (charging)" : "");
         }
         return;
     }
-    if (!charging && pct <= LOW_BATTERY_ALERT_PCT) {
-        alerted = true;
-        Serial.printf("Battery: %d%% — low-battery alert\n", pct);
-        handle_result_code('L', '2', '1', "battery"); // اهتزاز طويل قوي
+    int threshold = 0;
+    if (pct <= CRITICAL_BATTERY_ALERT_PCT && alerted_at > CRITICAL_BATTERY_ALERT_PCT) {
+        threshold = CRITICAL_BATTERY_ALERT_PCT;
+    } else if (pct <= LOW_BATTERY_ALERT_PCT && alerted_at > LOW_BATTERY_ALERT_PCT) {
+        threshold = LOW_BATTERY_ALERT_PCT;
     }
+    if (!threshold) return;
+    alerted_at = threshold;
+    // التنبيه يعرض النسبة نفسها: "شحن منخفض - 15%" (شرطة عادية — خط الساعة ما فيه "–")
+    char label[48];
+    snprintf(label, sizeof(label), "شحن منخفض - %d%%", pct);
+    Serial.printf("Battery: %d%% — %s alert\n", pct, threshold == CRITICAL_BATTERY_ALERT_PCT ? "critical" : "low-battery");
+    // ١٠٪: نقرات قوية متكررة (أوضح)، ٢٠٪: اهتزاز طويل قوي
+    handle_result_code('L', threshold == CRITICAL_BATTERY_ALERT_PCT ? '1' : '2', '1', "battery", label);
 }
 
 static void update_clock_display_cb(lv_timer_t *t)
@@ -1142,6 +1154,11 @@ static void update_clock_display_cb(lv_timer_t *t)
     int batt_pct = read_battery_percent();
     const bool charging = read_is_charging();
     check_low_battery(batt_pct, charging);
+    // رمز ونسبة البطارية بالأحمر لما الشحن منخفض (وما هي على الشاحن)
+    const bool batt_low = !charging && batt_pct >= 0 && batt_pct <= LOW_BATTERY_ALERT_PCT;
+    const lv_color_t batt_color = batt_low ? COLOR_DISCONNECTED : COLOR_MUTED;
+    lv_obj_set_style_text_color(batt_pct_label, batt_color, 0);
+    lv_obj_set_style_text_color(batt_icon_label, batt_color, 0);
     if (batt_pct >= 0) {
         char pct_buf[8];
         snprintf(pct_buf, sizeof(pct_buf), "%d%%", batt_pct);
