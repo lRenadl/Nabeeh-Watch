@@ -958,7 +958,7 @@ static void build_onboarding_screen()
     onboarding_screen = make_screen();
 
     lv_obj_t *question = lv_label_create(onboarding_screen);
-    lv_label_set_text(question, "كيف تحب تشوف الأصوات المكتشفة؟");
+    lv_label_set_text(question, "ما الطريقة التي تفضّلها لعرض الأصوات المكتشفة؟");
     lv_obj_set_style_text_font(question, &tajawal_regular_16, 0);
     lv_obj_set_style_text_color(question, COLOR_TEXT, 0);
     lv_obj_set_width(question, lv_pct(90));
@@ -1080,6 +1080,10 @@ static RtcSnapshot rtc_snapshot = {0, 0, 0, 0, 0, false};
 static void handle_result_code(char code, char pattern, char intensity, const char *source,
                                const char *label = nullptr); // defined further down
 
+// النسبة اللي انطلق عندها آخر تنبيه شحن — شاشة البطارية (show_battery_alert)
+// تعرضها بالحلقة والنص. UI task بس، زي check_low_battery.
+static int low_battery_alert_pct = 0;
+
 // UI task only (من update_clock_display_cb) — يمر عبر نفس طابور التنبيهات.
 static void check_low_battery(int pct, bool charging)
 {
@@ -1101,6 +1105,7 @@ static void check_low_battery(int pct, bool charging)
     }
     if (!threshold) return;
     alerted_at = threshold;
+    low_battery_alert_pct = pct;
     // التنبيه يعرض النسبة نفسها: "شحن منخفض - 15%" (شرطة عادية — خط الساعة ما فيه "–")
     char label[48];
     snprintf(label, sizeof(label), "شحن منخفض - %d%%", pct);
@@ -1325,10 +1330,96 @@ static void show_sign_result(int category_index)
     lv_screen_load_anim(sign_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
 }
 
+// تنبيه الشحن المنخفض بشكل إشعار البطارية في ساعة أبل: حلقة النسبة بالنص،
+// تحتها "البطارية" وجملة "متبقٍ N% من عمر البطارية." — بدون بطاقة، وبنفس زر
+// الإغلاق (X) وخلفية شاشة التنبيه العادية. الأرقام لاتينية (زي "15%" بالشاشة
+// الرئيسية) لأن الأرقام العربية جنب نص عربي تنقلب بمحرّك BIDI (انظر arabic_digits).
+static lv_obj_t *battery_alert_screen = NULL;
+static lv_obj_t *battery_alert_arc;
+static lv_obj_t *battery_alert_pct_lbl;
+static lv_obj_t *battery_alert_body_lbl;
+
+#define BATTERY_TRACK    lv_color_hex(0x3A3A48)
+#define BATTERY_AMBER    lv_color_hex(0xFFB020)
+
+static void build_battery_alert_screen()
+{
+    battery_alert_screen = make_screen();
+
+    // نفس زر الإغلاق اللي بشاشة التنبيه العادية
+    lv_obj_t *close_btn = lv_button_create(battery_alert_screen);
+    lv_obj_set_size(close_btn, 40, 40);
+    lv_obj_set_style_radius(close_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(close_btn, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_width(close_btn, 0, 0);
+    lv_obj_set_style_pad_all(close_btn, 0, 0);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -6, 6);
+    lv_obj_add_event_cb(close_btn, dismiss_alert_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_icon = lv_label_create(close_btn);
+    lv_label_set_text(close_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(close_icon, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(close_icon, COLOR_TEXT, 0);
+    lv_obj_center(close_icon);
+
+    battery_alert_arc = lv_arc_create(battery_alert_screen);
+    lv_obj_set_size(battery_alert_arc, 96, 96);
+    lv_arc_set_rotation(battery_alert_arc, 270);
+    lv_arc_set_bg_angles(battery_alert_arc, 0, 360);
+    lv_arc_set_range(battery_alert_arc, 0, 100);
+    lv_obj_remove_style(battery_alert_arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(battery_alert_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(battery_alert_arc, 7, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(battery_alert_arc, BATTERY_TRACK, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(battery_alert_arc, 7, LV_PART_INDICATOR);
+    lv_obj_align(battery_alert_arc, LV_ALIGN_CENTER, 0, -36);
+
+    battery_alert_pct_lbl = lv_label_create(battery_alert_arc);
+    lv_obj_set_style_text_font(battery_alert_pct_lbl, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(battery_alert_pct_lbl, COLOR_TEXT, 0);
+    lv_obj_center(battery_alert_pct_lbl);
+
+    lv_obj_t *title = lv_label_create(battery_alert_screen);
+    lv_label_set_text(title, "البطارية");
+    lv_obj_set_style_text_font(title, &tajawal_bold_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 36);
+
+    battery_alert_body_lbl = lv_label_create(battery_alert_screen);
+    lv_obj_set_width(battery_alert_body_lbl, lv_pct(90));
+    lv_label_set_long_mode(battery_alert_body_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(battery_alert_body_lbl, &tajawal_regular_16, 0);
+    lv_obj_set_style_text_color(battery_alert_body_lbl, COLOR_MUTED, 0);
+    lv_obj_set_style_text_align(battery_alert_body_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_base_dir(battery_alert_body_lbl, LV_BASE_DIR_RTL, 0);
+    lv_obj_align(battery_alert_body_lbl, LV_ALIGN_CENTER, 0, 72);
+}
+
+static void show_battery_alert(int pct)
+{
+    if (!battery_alert_screen) {
+        build_battery_alert_screen();
+    }
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    // ١٠٪ وأقل بالأحمر، ٢٠٪ بالأصفر — نفس تدرّج التنبيه على الجوال
+    lv_obj_set_style_arc_color(battery_alert_arc,
+                               pct <= CRITICAL_BATTERY_ALERT_PCT ? COLOR_DISCONNECTED : BATTERY_AMBER,
+                               LV_PART_INDICATOR);
+    lv_arc_set_value(battery_alert_arc, pct);
+    lv_label_set_text_fmt(battery_alert_pct_lbl, "%d%%", pct);
+    lv_label_set_text_fmt(battery_alert_body_lbl, "متبقٍ %d%% من عمر البطارية.", pct);
+    lv_screen_load_anim(battery_alert_screen, LV_SCR_LOAD_ANIM_FADE_IN, 200, 0, false);
+}
+
 // label_override: اسم التذكير لو فيه واحد. أي شي ثاني (تنبيهات تصنيف الصوت)
 // يمرّر nullptr فيُعرض اسم الفئة العام زي قبل.
 static void show_alert(int category_index, const char *label_override = nullptr)
 {
+    if (category_index == low_battery_category_index()) {
+        show_battery_alert(low_battery_alert_pct);
+        return;
+    }
     const AlertCategory &cat = alert_categories[category_index];
     // Some categories (currently just "تذكير") have no sign-language video
     // yet — cat.sign_gif is nullptr for those. Falling through to
@@ -1658,7 +1749,7 @@ static void build_settings_screen()
 
     // section label
     lv_obj_t *section = lv_label_create(content);
-    lv_label_set_text(section, "طريقة عرض الصوت");
+    lv_label_set_text(section, "طريقة عرض الأصوات المكتشفة");
     lv_obj_set_style_text_font(section, &tajawal_regular_16, 0);
     lv_obj_set_style_text_color(section, COLOR_MUTED, 0);
     lv_obj_set_width(section, lv_pct(100));
@@ -1710,7 +1801,7 @@ static void build_settings_screen()
     }
 
     // action buttons — الترتيب: الواي فاي، إلغاء الارتباط، إعادة التشغيل
-    lv_obj_t *wifi_btn = make_settings_button(content, LV_SYMBOL_WIFI, "شبكة الواي فاي",
+    lv_obj_t *wifi_btn = make_settings_button(content, LV_SYMBOL_WIFI, "شبكة الإنترنت",
                                               go_to_wifi_settings_cb);
     lv_obj_set_style_margin_top(wifi_btn, 4, 0);
     make_settings_button(content, LV_SYMBOL_CLOSE, "إلغاء ارتباط الهاتف", show_unpair_confirm_cb);
