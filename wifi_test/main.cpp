@@ -611,7 +611,6 @@ static lv_obj_t *settings_screen = NULL;
 static lv_obj_t *wifi_settings_screen = NULL;
 static lv_obj_t *wifi_current_network_lbl = NULL;
 static lv_obj_t *wifi_saved_list = NULL;         // scrollable column of saved-network rows, rebuilt by refresh_wifi_saved_list()
-static lv_obj_t *wifi_reset_confirm_overlay = NULL;
 // Set by the Settings screen's "إلغاء ارتباط الهاتف" confirm (UI task);
 // network_task calls forget_pairing() and drops the current TCP client, since
 // it owns that socket.
@@ -1563,15 +1562,16 @@ static void handle_result_code(char code, char pattern, char intensity, const ch
 // زر إعدادات كبير (٤٦px) بأيقونة ونص بالنص — أكبر من قبل (٣٦px) ومعه لون
 // ضغط واضح، عشان اللمسة تنضغط على الزر المقصود من أول مرة.
 static lv_obj_t *make_settings_button(lv_obj_t *parent, const char *symbol, const char *text,
-                                      lv_event_cb_t cb)
+                                      lv_event_cb_t cb, bool danger = false)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, lv_pct(100), 46);
     lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_10, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(btn, lv_color_white(), 0);
-    lv_obj_set_style_border_opa(btn, LV_OPA_30, 0);
+    // إجراء خطير (مسح مثلًا) بإطار ونص أحمر عشان يتميّز عن الباقي
+    lv_obj_set_style_border_color(btn, danger ? COLOR_DISCONNECTED : lv_color_white(), 0);
+    lv_obj_set_style_border_opa(btn, danger ? LV_OPA_60 : LV_OPA_30, 0);
     lv_obj_set_style_border_width(btn, 1, 0);
     lv_obj_set_style_radius(btn, 12, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
@@ -1584,12 +1584,12 @@ static lv_obj_t *make_settings_button(lv_obj_t *parent, const char *symbol, cons
     lv_obj_t *icon = lv_label_create(btn);
     lv_label_set_text(icon, symbol);
     lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(icon, COLOR_MUTED, 0);
+    lv_obj_set_style_text_color(icon, danger ? COLOR_DISCONNECTED : COLOR_MUTED, 0);
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_font(lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
+    lv_obj_set_style_text_color(lbl, danger ? COLOR_DISCONNECTED : COLOR_TEXT, 0);
     return btn;
 }
 
@@ -1746,11 +1746,12 @@ static void refresh_wifi_saved_list()
         shown++;
 
         lv_obj_t *row = lv_button_create(wifi_saved_list);
-        lv_obj_set_size(row, lv_pct(100), 40);
+        lv_obj_set_size(row, lv_pct(100), 46);
         lv_obj_set_style_bg_opa(row, LV_OPA_10, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_30, LV_STATE_PRESSED);
         lv_obj_set_style_bg_color(row, lv_color_white(), 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
-        lv_obj_set_style_radius(row, 10, 0);
+        lv_obj_set_style_radius(row, 12, 0);
         // i يُمرَّر كـuser_data عشان connect_to_saved_network_cb يعرف أي شبكة
         // بالضبط انضغطت — نفس فكرة تمرير فهرس لعنصر بقائمة ديناميكية.
         lv_obj_add_event_cb(row, connect_to_saved_network_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
@@ -1787,80 +1788,24 @@ static void go_to_settings_from_wifi_cb(lv_event_t *e)
     lv_screen_load_anim(settings_screen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
 }
 
-static void close_wifi_reset_confirm_cb(lv_event_t *e)
-{
-    if (wifi_reset_confirm_overlay) {
-        lv_obj_delete(wifi_reset_confirm_overlay);
-        wifi_reset_confirm_overlay = NULL;
-    }
-}
-
 // المسح نفسه (clear_saved_networks + تحديث القائمة) يصير هنا فورًا على مهمة
 // الواجهة — نفس ما ذكرناه بتعليق wifi_reset_requested: NVS مو مقيدة بمهمة
 // معينة بهذا الملف. wifi_reset_requested يبقى فقط لطلب قطع الراديو الفعلي
 // من مهمة الشبكة (تلك اللي تملك WiFi.disconnect()/الاتصال الحالي).
-static void confirm_wifi_reset_cb(lv_event_t *e)
+static void do_clear_saved_networks()
 {
     clear_saved_networks();
     refresh_wifi_saved_list();
     wifi_reset_requested = true;
-    close_wifi_reset_confirm_cb(e);
 }
 
 static void show_wifi_reset_confirm_cb(lv_event_t *e)
 {
-    lv_obj_t *parent = lv_screen_active();
-
-    wifi_reset_confirm_overlay = lv_obj_create(parent);
-    lv_obj_remove_style_all(wifi_reset_confirm_overlay);
-    lv_obj_set_size(wifi_reset_confirm_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(wifi_reset_confirm_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(wifi_reset_confirm_overlay, LV_OPA_60, 0);
-    lv_obj_center(wifi_reset_confirm_overlay);
-
-    lv_obj_t *card = lv_obj_create(wifi_reset_confirm_overlay);
-    lv_obj_set_size(card, lv_pct(85), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(card, COLOR_PRIMARY, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(card, 12, 0);
-    lv_obj_center(card);
-
-    lv_obj_t *question = lv_label_create(card);
-    lv_label_set_text(question, "هل فعلاً تبي تمسح كل الشبكات المحفوظة؟");
-    lv_obj_set_style_text_font(question, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(question, COLOR_TEXT, 0);
-    lv_obj_set_width(question, lv_pct(100));
-    lv_obj_set_style_text_align(question, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_obj_t *yes_btn = lv_button_create(card);
-    lv_obj_set_size(yes_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_color(yes_btn, COLOR_DISCONNECTED, 0);
-    lv_obj_set_style_bg_opa(yes_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(yes_btn, 10, 0);
-    lv_obj_add_event_cb(yes_btn, confirm_wifi_reset_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
-    lv_label_set_text(yes_lbl, "نعم، امسح الكل");
-    lv_obj_set_style_text_font(yes_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
-    lv_obj_center(yes_lbl);
-
-    lv_obj_t *no_btn = lv_button_create(card);
-    lv_obj_set_size(no_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(no_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(no_btn, lv_color_white(), 0);
-    lv_obj_set_style_border_opa(no_btn, LV_OPA_40, 0);
-    lv_obj_set_style_border_width(no_btn, 1, 0);
-    lv_obj_set_style_radius(no_btn, 10, 0);
-    lv_obj_add_event_cb(no_btn, close_wifi_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *no_lbl = lv_label_create(no_btn);
-    lv_label_set_text(no_lbl, "لا");
-    lv_obj_set_style_text_font(no_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(no_lbl, COLOR_TEXT, 0);
-    lv_obj_center(no_lbl);
+    LV_UNUSED(e);
+    show_confirm_modal(LV_SYMBOL_TRASH, COLOR_DISCONNECTED,
+                       "مسح الشبكات؟",
+                       "ستُحذف كل الشبكات المحفوظة وتنقطع الساعة عن الإنترنت.",
+                       "مسح كل الشبكات", do_clear_saved_networks);
 }
 
 static void build_wifi_settings_screen()
@@ -1893,13 +1838,18 @@ static void build_wifi_settings_screen()
     lv_obj_set_style_text_color(title, COLOR_TEXT, 0);
     lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_LEFT_MID, -6, 0);
 
+    // نفس صفحة الإعدادات: العنوان ثابت والمحتوى بس يتمرّر
     lv_obj_t *content = lv_obj_create(wifi_settings_screen);
     lv_obj_remove_style_all(content);
     lv_obj_remove_flag(content, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_size(content, lv_pct(100), LV_VER_RES - 24 /* حشوة الشاشة */ - 28 - 8);
     lv_obj_align_to(content, header, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(content, 10, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_set_style_pad_bottom(content, 8, 0);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_remove_flag(wifi_settings_screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // الشبكة الحالية
     lv_obj_t *current_section = lv_label_create(content);
@@ -1917,35 +1867,12 @@ static void build_wifi_settings_screen()
     lv_obj_set_style_text_align(wifi_current_network_lbl, LV_TEXT_ALIGN_RIGHT, 0);
 
     // تغيير الشبكة (يضيف شبكة جديدة عبر نفس تدفق BLE/نقطة الوصول الحالي)
-    lv_obj_t *change_btn = lv_button_create(content);
-    lv_obj_set_size(change_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(change_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(change_btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_border_opa(change_btn, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(change_btn, 1, 0);
-    lv_obj_set_style_radius(change_btn, 10, 0);
-    lv_obj_set_style_margin_top(change_btn, 6, 0);
-    lv_obj_add_event_cb(change_btn, change_wifi_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *change_lbl = lv_label_create(change_btn);
-    lv_label_set_text(change_lbl, "تغيير الشبكة");
-    lv_obj_set_style_text_font(change_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(change_lbl, COLOR_TEXT, 0);
-    lv_obj_center(change_lbl);
+    lv_obj_t *change_btn = make_settings_button(content, LV_SYMBOL_WIFI, "تغيير الشبكة", change_wifi_cb);
+    lv_obj_set_style_margin_top(change_btn, 4, 0);
 
     // مسح كل الشبكات المحفوظة
-    lv_obj_t *reset_btn = lv_button_create(content);
-    lv_obj_set_size(reset_btn, lv_pct(100), 36);
-    lv_obj_set_style_bg_opa(reset_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(reset_btn, COLOR_DISCONNECTED, 0);
-    lv_obj_set_style_border_opa(reset_btn, LV_OPA_60, 0);
-    lv_obj_set_style_border_width(reset_btn, 1, 0);
-    lv_obj_set_style_radius(reset_btn, 10, 0);
-    lv_obj_add_event_cb(reset_btn, show_wifi_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *reset_lbl = lv_label_create(reset_btn);
-    lv_label_set_text(reset_lbl, "مسح كل الشبكات المحفوظة");
-    lv_obj_set_style_text_font(reset_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(reset_lbl, COLOR_DISCONNECTED, 0);
-    lv_obj_center(reset_lbl);
+    make_settings_button(content, LV_SYMBOL_TRASH, "مسح كل الشبكات المحفوظة",
+                         show_wifi_reset_confirm_cb, true);
 
     // الشبكات المحفوظة
     lv_obj_t *saved_section = lv_label_create(content);
