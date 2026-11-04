@@ -626,7 +626,7 @@ static lv_obj_t *status_label;
 static lv_obj_t *status_dot;
 static lv_obj_t *wifi_status_box = NULL;   // colored callout card wrapping wifi_status_label — makes the state change hard to miss, not just different text
 static lv_obj_t *wifi_status_label = NULL; // Settings screen feedback for the "change Wi-Fi" button; NULL until build_settings_screen() runs
-static bool sign_language_mode = true; // matches the pre-selected option in onboarding
+static bool sign_language_mode = true; // default until the user picks in onboarding (neither option is pre-selected)
 // Was: a manual "pairing preference" toggled only by the Settings screen's
 // disconnect button, defaulting to true (claiming "connected" even right
 // after boot, before any phone had ever talked to the watch) and never
@@ -890,9 +890,15 @@ static void show_unpair_confirm_cb(lv_event_t *e)
                        "إلغاء ارتباط الهاتف", do_unpair_phone);
 }
 
+static lv_obj_t *onboarding_sign_btn;
+static lv_obj_t *onboarding_text_btn;
+
 static void splash_timeout_cb(lv_timer_t *t)
 {
     lv_timer_delete(t);
+    // "إعادة التشغيل" يرجّع لشاشة الاختيار — نبدأها بدون اختيار سابق
+    lv_obj_remove_state(onboarding_sign_btn, LV_STATE_CHECKED);
+    lv_obj_remove_state(onboarding_text_btn, LV_STATE_CHECKED);
     lv_screen_load_anim(onboarding_screen, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, false);
 }
 
@@ -918,16 +924,29 @@ static void show_restart_confirm_cb(lv_event_t *e)
                        "إعادة تشغيل الساعة", do_restart_watch);
 }
 
+static void onboarding_done_cb(lv_timer_t *t)
+{
+    LV_UNUSED(t);
+    lv_screen_load_anim(home_screen, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, false);
+}
+
+// الزر المختار يبيضّ، ونتأخر شوي قبل الرئيسية عشان المستخدم يشوف اختياره
+static void onboarding_choose(lv_obj_t *btn, bool sign_mode)
+{
+    sign_language_mode = sign_mode;
+    lv_obj_add_state(btn, LV_STATE_CHECKED);
+    lv_timer_t *t = lv_timer_create(onboarding_done_cb, 350, NULL);
+    lv_timer_set_repeat_count(t, 1);
+}
+
 static void choose_sign_language_cb(lv_event_t *e)
 {
-    sign_language_mode = true;
-    lv_screen_load_anim(home_screen, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, false);
+    onboarding_choose((lv_obj_t *)lv_event_get_target(e), true);
 }
 
 static void choose_text_mode_cb(lv_event_t *e)
 {
-    sign_language_mode = false;
-    lv_screen_load_anim(home_screen, LV_SCR_LOAD_ANIM_FADE_IN, 300, 0, false);
+    onboarding_choose((lv_obj_t *)lv_event_get_target(e), false);
 }
 
 static lv_obj_t *make_screen()
@@ -953,6 +972,39 @@ static void build_splash_screen()
     lv_timer_set_repeat_count(t, 1);
 }
 
+// خيارَي شاشة البداية بنفس الشكل (إطار خفيف، بدون تمييز لأي واحد) — اللي
+// ينضغط يبيضّ ونصه يصير كحلي. لون النص على الزر نفسه عشان الـlabel يورثه
+// حسب حالة الزر.
+static lv_obj_t *make_onboarding_option(const char *text, lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_button_create(onboarding_screen);
+    lv_obj_set_size(btn, lv_pct(90), 44);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    // الثيم الافتراضي يلوّن الزر المختار (CHECKED) بالأحمر — نثبّت الأبيض لكل
+    // حالة صراحة، وإلا تغلب لونه على اللون العادي.
+    static const lv_style_selector_t chosen[] = {
+        LV_STATE_PRESSED, LV_STATE_CHECKED, LV_STATE_CHECKED | LV_STATE_PRESSED,
+        LV_STATE_FOCUSED | LV_STATE_CHECKED,
+    };
+    for (lv_style_selector_t sel : chosen) {
+        lv_obj_set_style_bg_color(btn, lv_color_white(), sel);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, sel);
+        lv_obj_set_style_text_color(btn, COLOR_PRIMARY, sel);
+    }
+    lv_obj_set_style_border_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(btn, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_text_color(btn, COLOR_TEXT, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &tajawal_regular_16, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
 static void build_onboarding_screen()
 {
     onboarding_screen = make_screen();
@@ -965,33 +1017,11 @@ static void build_onboarding_screen()
     lv_obj_set_style_text_align(question, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(question, LV_ALIGN_TOP_MID, 0, 30);
 
-    lv_obj_t *sign_btn = lv_button_create(onboarding_screen);
-    lv_obj_set_size(sign_btn, lv_pct(90), 44);
-    lv_obj_set_style_bg_color(sign_btn, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(sign_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(sign_btn, 10, 0);
-    lv_obj_align_to(sign_btn, question, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
-    lv_obj_add_event_cb(sign_btn, choose_sign_language_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *sign_lbl = lv_label_create(sign_btn);
-    lv_label_set_text(sign_lbl, "لغة الإشارة");
-    lv_obj_set_style_text_font(sign_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(sign_lbl, COLOR_PRIMARY, 0);
-    lv_obj_center(sign_lbl);
+    onboarding_sign_btn = make_onboarding_option("لغة الإشارة", choose_sign_language_cb);
+    lv_obj_align_to(onboarding_sign_btn, question, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
-    lv_obj_t *text_btn = lv_button_create(onboarding_screen);
-    lv_obj_set_size(text_btn, lv_pct(90), 44);
-    lv_obj_set_style_bg_opa(text_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(text_btn, lv_color_white(), 0);
-    lv_obj_set_style_border_opa(text_btn, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(text_btn, 1, 0);
-    lv_obj_set_style_radius(text_btn, 10, 0);
-    lv_obj_align_to(text_btn, sign_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
-    lv_obj_add_event_cb(text_btn, choose_text_mode_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *text_lbl = lv_label_create(text_btn);
-    lv_label_set_text(text_lbl, "نص / أيقونة");
-    lv_obj_set_style_text_font(text_lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(text_lbl, COLOR_TEXT, 0);
-    lv_obj_center(text_lbl);
+    onboarding_text_btn = make_onboarding_option("نص / أيقونة", choose_text_mode_cb);
+    lv_obj_align_to(onboarding_text_btn, onboarding_sign_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 }
 
 static void build_home_screen()
@@ -1492,6 +1522,7 @@ static void show_result_category(const ResultMessage &msg)
 {
     const int category_index = msg.category_index;
     show_alert(category_index, msg.label);
+    lv_display_trigger_activity(NULL); // السطوع يرجع كامل (update_screen_brightness)
     if (alert_return_timer) {
         lv_timer_delete(alert_return_timer);
     }
@@ -3893,9 +3924,30 @@ void setup()
     xTaskCreatePinnedToCore(network_task, "network", 16384, NULL, 1, NULL, 0);
 }
 
+// السطوع على النص عشان البطارية: الشاشة تخفت (٥٠) بعد ١٠ ثواني بدون لمس،
+// وترجع كاملة (٢٥٥) أول ما تنلمس أو يطلع تنبيه — وتبقى كاملة طول ما التنبيه
+// على الشاشة (alert_return_timer شغّال). LVGL يحسب وقت آخر لمسة بنفسه من
+// مدخل اللمس، وshow_result_category يصفّره مع كل تنبيه.
+#define SCREEN_BRIGHT_LEVEL 255
+#define SCREEN_DIM_LEVEL    50
+#define SCREEN_DIM_AFTER_MS 10000
+
+static void update_screen_brightness()
+{
+    static int current = -1;
+    const bool alert_showing = alert_return_timer != NULL;
+    const bool recently_used = lv_display_get_inactive_time(NULL) < SCREEN_DIM_AFTER_MS;
+    const int level = (alert_showing || recently_used) ? SCREEN_BRIGHT_LEVEL : SCREEN_DIM_LEVEL;
+    if (level == current) return;
+    current = level;
+    instance.setBrightness(level);
+    Serial.printf("Brightness: %d\n", level);
+}
+
 void loop()
 {
     lv_timer_handler();
+    update_screen_brightness();
 
     // BLE radio activity can occasionally corrupt whatever's mid-draw on the
     // display (see start_ble_provisioning()'s comment) — LVGL only redraws
