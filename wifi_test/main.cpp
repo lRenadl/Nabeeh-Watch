@@ -1570,7 +1570,9 @@ static void show_result_category(const ResultMessage &msg)
 #define DRV2605_REG_SEQ1   0x04 // 0x04..0x0B = 8 waveform-sequence slots
 #define DRV2605_REG_GO     0x0C
 #define DRV2605_REG_CLAMPV 0x17
-#define HAPTIC_OD_CLAMP    0xB9 // ≈4.0 V peak (factory default 0x8C ≈ 3.0 V)
+// أعلى قيمة (٥٫٥ فولت نظريًا) — عمليًا الشريحة تطلع بجهد البطارية كاملًا
+// (~٣٫٧–٤٫٢ فولت)، يعني أقصى ما يقدر المحرك ياخذه. كان 0xB9 ≈ ٤ فولت.
+#define HAPTIC_OD_CLAMP    0xFF
 #define HAPTIC_WAIT(ms10)  (uint8_t)(0x80 | (ms10)) // sequencer pause, units of 10 ms (max 127)
 
 static bool drv2605_write(uint8_t reg, uint8_t value)
@@ -1599,36 +1601,58 @@ static void haptic_play_sequence(const uint8_t *seq, size_t len)
     drv2605_write(DRV2605_REG_GO, 1);
 }
 
+// أنماط الاهتزاز اللي يختارها المستخدم بالتطبيق، من مكتبة DRV2605 (ERM
+// Library 1) وبأعلى جهد (HAPTIC_OD_CLAMP):
+//   خفيف  = 52 Pulsing Strong 1 (100%)
+//   متوسط = 58 Transition Click 1 (100%)
+//   قوي   = 118 Long buzz for programmatic stopping (100%) — طنين متواصل
+//           ما يوقف بنفسه، فنوقفه بمؤقّت (GO = 0) بعد المدة المطلوبة.
+// التطبيق يرسل النمط معكوس (4 - قيمة التطبيق، انظر _toWatchVibrationCode):
+// خفيف → '3'، متوسط → '2'، قوي → '1'. "قوة الاهتزاز" تحدد كم مرة يتكرر
+// النمط (أو مدة الطنين الطويل). كل كتابات الـI2C هنا من مهمة الواجهة.
+#define HAPTIC_EFFECT_LIGHT   52
+#define HAPTIC_EFFECT_MEDIUM  58
+#define HAPTIC_EFFECT_LONG    118
+static lv_timer_t *haptic_stop_timer = NULL;
+
+static void haptic_stop_cb(lv_timer_t *t)
+{
+    LV_UNUSED(t);
+    haptic_stop_timer = NULL;
+    drv2605_write(DRV2605_REG_GO, 0);
+}
+
 static void trigger_vibration(char pattern, char intensity)
 {
-    // قوي/متوسط/خفيف — كل المستويات صارت أقوى من قبل؛ "خفيف" الآن يقارب
-    // "متوسط" القديم، و"قوي" أطول وأعلى جهدًا.
-    static const uint8_t click_strong[] = {12, HAPTIC_WAIT(25), 12, HAPTIC_WAIT(25), 12}; // 3× Triple Click
-    static const uint8_t click_medium[] = {12, HAPTIC_WAIT(30), 12};
-    static const uint8_t click_light[]  = {10, HAPTIC_WAIT(30), 10};                      // Double Click
+    if (haptic_stop_timer) { // تنبيه جديد يقطع اللي قبله
+        lv_timer_delete(haptic_stop_timer);
+        haptic_stop_timer = NULL;
+        drv2605_write(DRV2605_REG_GO, 0);
+    }
+    const int idx = (intensity == '1') ? 0 : (intensity == '2') ? 1 : 2; // قوي، متوسط، خفيف
 
-    static const uint8_t buzz_strong[]  = {15, HAPTIC_WAIT(30), 15};                      // 2× Alert 750ms
-    static const uint8_t buzz_medium[]  = {14, 14, HAPTIC_WAIT(30), 14, 14};              // Strong Buzz
-    static const uint8_t buzz_light[]   = {47, HAPTIC_WAIT(30), 47};                      // Buzz 1 100%
+    if (pattern == '1') {
+        static const uint16_t long_ms[] = {1500, 1000, 600};
+        const uint8_t seq[] = {HAPTIC_EFFECT_LONG};
+        haptic_play_sequence(seq, 1);
+        haptic_stop_timer = lv_timer_create(haptic_stop_cb, long_ms[idx], NULL);
+        lv_timer_set_repeat_count(haptic_stop_timer, 1);
+        return;
+    }
 
-    static const uint8_t bump_strong[]  = {7, 7, 7, HAPTIC_WAIT(30), 7, 7, 7};            // Soft Bump 100%
-    static const uint8_t bump_medium[]  = {7, 7, HAPTIC_WAIT(30), 7, 7};
-    static const uint8_t bump_light[]   = {8, 8, HAPTIC_WAIT(30), 8, 8};                  // Soft Bump 60%
-
-    const int idx = (intensity == '1') ? 0 : (intensity == '2') ? 1 : 2;
-    const uint8_t *seq;
-    size_t len;
-#define PICK(s, m, l) do { if (idx == 0) { seq = s; len = sizeof(s); } \
-                           else if (idx == 1) { seq = m; len = sizeof(m); } \
-                           else { seq = l; len = sizeof(l); } } while (0)
+    uint8_t effect;
     switch (pattern) {
-        case '1': PICK(click_strong, click_medium, click_light); break;
-        case '2': PICK(buzz_strong,  buzz_medium,  buzz_light);  break;
-        case '3': PICK(bump_strong,  bump_medium,  bump_light);  break;
+        case '2': effect = HAPTIC_EFFECT_MEDIUM; break;
+        case '3': effect = HAPTIC_EFFECT_LIGHT;  break;
         default: return;
     }
-#undef PICK
-    haptic_play_sequence(seq, len);
+    const uint8_t gap = HAPTIC_WAIT(30);
+    const uint8_t strong[] = {effect, gap, effect, gap, effect};
+    const uint8_t medium[] = {effect, gap, effect};
+    const uint8_t light[]  = {effect};
+    if (idx == 0)      haptic_play_sequence(strong, sizeof(strong));
+    else if (idx == 1) haptic_play_sequence(medium, sizeof(medium));
+    else               haptic_play_sequence(light, sizeof(light));
 }
 
 // اسم التذكير المطابق للدقيقة الحالية. لازم لأن تنبيه '#T' الجاي من الجوال
