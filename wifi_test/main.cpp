@@ -734,17 +734,37 @@ static void update_connection_status_poll_cb(lv_timer_t *t)
     update_connection_status();
 }
 
+// عرض النص بالبكسل بخط معيّن (سطر واحد) — نجمع عرض كل حرف بعد فك UTF-8.
+static int32_t text_width_px(const char *s, const lv_font_t *font)
+{
+    int32_t w = 0;
+    const uint8_t *p = (const uint8_t *)s;
+    while (*p) {
+        uint32_t c = *p++;
+        int extra = (c >= 0xF0) ? 3 : (c >= 0xE0) ? 2 : (c >= 0xC0) ? 1 : 0;
+        if (extra) c &= (0x3F >> extra);
+        while (extra-- > 0 && (*p & 0xC0) == 0x80) c = (c << 6) | (*p++ & 0x3F);
+        w += lv_font_get_glyph_width(font, c, 0);
+    }
+    return w;
+}
+
 // wifi_current_network_lbl only exists once the Wi-Fi settings screen has
 // been opened once (built lazily by go_to_wifi_settings_cb) — same
 // null-guard reasoning as wifi_status_box above.
 static void update_wifi_current_network_display_cb(lv_timer_t *t)
 {
     if (!wifi_current_network_lbl) return;
-    if (WiFi.status() == WL_CONNECTED) {
-        lv_label_set_text(wifi_current_network_lbl, WiFi.SSID().c_str());
-    } else {
-        lv_label_set_text(wifi_current_network_lbl, "غير متصلة");
-    }
+    String text = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String("غير متصلة");
+    if (text == lv_label_get_text(wifi_current_network_lbl)) return;
+    // اسم شبكة طويل (مثل HUAWEI_E5783_28D6) بالخط الكبير ينقسم على سطرين —
+    // لو ما يتسع بسطر واحد نصغّر الخط بدل ما ينكسر الاسم.
+    int32_t avail = lv_obj_get_content_width(lv_obj_get_parent(wifi_current_network_lbl));
+    if (avail <= 0) avail = LV_HOR_RES - 24;
+    const lv_font_t *font = (text_width_px(text.c_str(), &tajawal_bold_24) <= avail)
+                                ? &tajawal_bold_24 : &tajawal_regular_16;
+    lv_obj_set_style_text_font(wifi_current_network_lbl, font, 0);
+    lv_label_set_text(wifi_current_network_lbl, text.c_str());
 }
 
 // يرصد لحظة رجوع نتيجة مسح الشبكات القريبة (نفس نمط was_ready اللي تستخدمه
@@ -782,65 +802,38 @@ static void confirm_modal_yes_cb(lv_event_t *e)
     if (action) action();
 }
 
-static lv_obj_t *make_modal_button(lv_obj_t *parent, const char *text, bool filled,
-                                   lv_color_t color, lv_event_cb_t cb)
-{
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_size(btn, lv_pct(100), 42);
-    lv_obj_set_style_radius(btn, 12, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-    if (filled) {
-        lv_obj_set_style_bg_color(btn, color, 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_70, LV_STATE_PRESSED);
-    } else {
-        lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_10, 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_STATE_PRESSED);
-    }
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, &tajawal_regular_16, 0);
-    lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
-    lv_obj_center(lbl);
-    return btn;
-}
+// نافذة التأكيد بنفس شكل باقي الصفحات: خلفية التدرّج نفسها (make_screen) وأزرار
+// make_settings_button نفسها — الأحمر (danger) للإجراءات الحساسة: مسح، إلغاء ارتباط، إعادة تشغيل.
+static lv_obj_t *make_settings_button(lv_obj_t *parent, const char *symbol, const char *text,
+                                      lv_event_cb_t cb, bool danger = false);
 
-static void show_confirm_modal(const char *symbol, lv_color_t accent, const char *title,
+static void show_confirm_modal(const char *symbol, bool danger, const char *title,
                                const char *message, const char *confirm_text,
                                confirm_action_fn action)
 {
     if (confirm_modal_overlay) return; // نافذة وحدة بس، حتى لو انضغط الزر مرتين
     pending_confirm_action = action;
 
-    // الطبقة الخلفية clickable (افتراضيًا) فتمتص أي لمسة برا البطاقة بدل ما
-    // توصل للأزرار اللي تحتها.
+    // صفحة كاملة تغطي الشاشة (clickable افتراضيًا) فتمتص أي لمسة بدل ما توصل
+    // للأزرار اللي تحتها.
     confirm_modal_overlay = lv_obj_create(lv_screen_active());
-    lv_obj_remove_style_all(confirm_modal_overlay);
-    lv_obj_add_flag(confirm_modal_overlay, LV_OBJ_FLAG_FLOATING);
-    lv_obj_set_size(confirm_modal_overlay, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_style_bg_color(confirm_modal_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(confirm_modal_overlay, LV_OPA_70, 0);
-    lv_obj_align(confirm_modal_overlay, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_t *card = lv_obj_create(confirm_modal_overlay);
-    lv_obj_set_size(card, lv_pct(92), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(card, COLOR_PRIMARY, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_border_color(card, accent, 0);
-    lv_obj_set_style_border_opa(card, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_pad_all(card, 12, 0);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(card, 6, 0);
-    lv_obj_center(card);
+    lv_obj_t *page = confirm_modal_overlay;
+    lv_obj_remove_style_all(page);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_FLOATING);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(page, LV_HOR_RES, LV_VER_RES);
+    lv_obj_align(page, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(page, COLOR_BG, 0);
+    lv_obj_set_style_bg_grad_color(page, COLOR_PRIMARY, 0);
+    lv_obj_set_style_bg_grad_dir(page, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(page, 12, 0);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(page, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(page, 10, 0);
 
     // عنوان مع أيقونة بنفس السطر
-    lv_obj_t *title_row = lv_obj_create(card);
+    lv_obj_t *title_row = lv_obj_create(page);
     lv_obj_remove_style_all(title_row);
     lv_obj_set_size(title_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW_REVERSE);
@@ -850,25 +843,26 @@ static void show_confirm_modal(const char *symbol, lv_color_t accent, const char
     lv_obj_t *icon = lv_label_create(title_row);
     lv_label_set_text(icon, symbol);
     lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(icon, accent, 0);
+    lv_obj_set_style_text_color(icon, danger ? COLOR_DISCONNECTED : COLOR_MUTED, 0);
 
     lv_obj_t *title_lbl = lv_label_create(title_row);
     lv_label_set_text(title_lbl, title);
     lv_obj_set_style_text_font(title_lbl, &tajawal_bold_24, 0);
     lv_obj_set_style_text_color(title_lbl, COLOR_TEXT, 0);
 
-    lv_obj_t *msg = lv_label_create(card);
+    lv_obj_t *msg = lv_label_create(page);
     lv_label_set_text(msg, message);
     lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(msg, &tajawal_regular_16, 0);
     lv_obj_set_style_text_color(msg, COLOR_MUTED, 0);
     lv_obj_set_width(msg, lv_pct(100));
     lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_margin_bottom(msg, 4, 0);
+    lv_obj_set_style_margin_bottom(msg, 6, 0);
 
-    make_modal_button(card, confirm_text, true, accent, confirm_modal_yes_cb);
-    lv_obj_t *no_btn = make_modal_button(card, "تراجع", false, COLOR_TEXT, close_confirm_modal_cb);
-    lv_obj_set_style_margin_top(no_btn, 2, 0);
+    make_settings_button(page, symbol, confirm_text, confirm_modal_yes_cb, danger);
+    // "تراجع" بنفس شكل زر الإعدادات العادي، بس بدون أيقونة
+    lv_obj_t *no_btn = make_settings_button(page, "", "تراجع", close_confirm_modal_cb);
+    lv_obj_delete(lv_obj_get_child(no_btn, 0));
 }
 
 // Replaces the old "فصل الساعة عن الجوال", which only closed the socket: with
@@ -884,7 +878,7 @@ static void do_unpair_phone()
 static void show_unpair_confirm_cb(lv_event_t *e)
 {
     LV_UNUSED(e);
-    show_confirm_modal(LV_SYMBOL_WARNING, COLOR_DISCONNECTED,
+    show_confirm_modal(LV_SYMBOL_WARNING, true,
                        "إلغاء الارتباط؟",
                        "ستتوقف التنبيهات حتى تعيد ربط الساعة بالتطبيق.",
                        "إلغاء ارتباط الهاتف", do_unpair_phone);
@@ -918,7 +912,7 @@ static void do_restart_watch() { restart_watch_cb(nullptr); }
 static void show_restart_confirm_cb(lv_event_t *e)
 {
     LV_UNUSED(e);
-    show_confirm_modal(LV_SYMBOL_REFRESH, lv_color_hex(0x1773CF),
+    show_confirm_modal(LV_SYMBOL_REFRESH, true,
                        "إعادة التشغيل؟",
                        "ستعود الساعة إلى شاشة البداية خلال ثوانٍ.",
                        "إعادة تشغيل الساعة", do_restart_watch);
@@ -1239,6 +1233,9 @@ static void alert_pulse_anim_cb(void *obj, int32_t v)
 static void build_alert_screen()
 {
     alert_screen = make_screen();
+    // ثابتة: النص اللي تحت يطلع شوي برا حدود المحتوى، فبدون هذا تصير الشاشة قابلة
+    // للتمرير ويبان شريط تمرير رمادي (وأي لمسة تحرّكها).
+    lv_obj_remove_flag(alert_screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // زر إغلاق (X) بدل سهم الرجوع: التنبيه الآن يقعد على الشاشة دقيقة كاملة
     // (انظر REMINDER_AUTO_RETURN_MS)، فلازم يكون واضح إن فيه طريقة تصرفه
@@ -1307,6 +1304,9 @@ static lv_obj_t *sign_category_lbl;
 static void build_sign_screen()
 {
     sign_screen = make_screen();
+    // ثابتة: النص اللي تحت يطلع شوي برا حدود المحتوى، فبدون هذا تصير الشاشة قابلة
+    // للتمرير ويبان شريط تمرير رمادي (وأي لمسة تحرّكها).
+    lv_obj_remove_flag(sign_screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // نفس زر الإغلاق اللي بشاشة التنبيه العادية — الشاشتين تظهران لنفس
     // السبب، فلازم تنصرفان بنفس الطريقة.
@@ -1375,6 +1375,9 @@ static lv_obj_t *battery_alert_body_lbl;
 static void build_battery_alert_screen()
 {
     battery_alert_screen = make_screen();
+    // ثابتة: النص اللي تحت يطلع شوي برا حدود المحتوى، فبدون هذا تصير الشاشة قابلة
+    // للتمرير ويبان شريط تمرير رمادي (وأي لمسة تحرّكها).
+    lv_obj_remove_flag(battery_alert_screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // نفس زر الإغلاق اللي بشاشة التنبيه العادية
     lv_obj_t *close_btn = lv_button_create(battery_alert_screen);
@@ -1725,7 +1728,7 @@ static void handle_result_code(char code, char pattern, char intensity, const ch
 // زر إعدادات كبير (٤٦px) بأيقونة ونص بالنص — أكبر من قبل (٣٦px) ومعه لون
 // ضغط واضح، عشان اللمسة تنضغط على الزر المقصود من أول مرة.
 static lv_obj_t *make_settings_button(lv_obj_t *parent, const char *symbol, const char *text,
-                                      lv_event_cb_t cb, bool danger = false)
+                                      lv_event_cb_t cb, bool danger)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, lv_pct(100), 46);
@@ -1909,7 +1912,15 @@ static void refresh_wifi_saved_list()
         shown++;
 
         lv_obj_t *row = lv_button_create(wifi_saved_list);
-        lv_obj_set_size(row, lv_pct(100), 46);
+        // ارتفاع حسب المحتوى: اسم الشبكة بسطر و"متصلة الآن" تحته — كانوا بسطر
+        // واحد أعرض من الزر فينقص النص من الجهتين (والعربي واللاتيني يتلخبط ترتيبهم)
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_min_height(row, 46, 0);
+        lv_obj_set_style_pad_ver(row, 6, 0);
+        lv_obj_set_style_pad_hor(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(row, 0, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_10, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_30, LV_STATE_PRESSED);
         lv_obj_set_style_bg_color(row, lv_color_white(), 0);
@@ -1920,12 +1931,19 @@ static void refresh_wifi_saved_list()
         lv_obj_add_event_cb(row, connect_to_saved_network_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
         lv_obj_t *row_lbl = lv_label_create(row);
-        char buf[96];
-        snprintf(buf, sizeof(buf), "%s%s", saved_networks[i].ssid, is_current ? "  (متصلة الآن)" : "");
-        lv_label_set_text(row_lbl, buf);
+        lv_label_set_text(row_lbl, saved_networks[i].ssid);
         lv_obj_set_style_text_font(row_lbl, &tajawal_regular_16, 0);
-        lv_obj_set_style_text_color(row_lbl, is_current ? lv_color_hex(0x35D07F) : COLOR_TEXT, 0);
-        lv_obj_center(row_lbl);
+        lv_obj_set_style_text_color(row_lbl, COLOR_TEXT, 0);
+        lv_obj_set_width(row_lbl, lv_pct(100));
+        lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(row_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+        if (is_current) {
+            lv_obj_t *state_lbl = lv_label_create(row);
+            lv_label_set_text(state_lbl, "متصلة الآن");
+            lv_obj_set_style_text_font(state_lbl, &tajawal_regular_16, 0);
+            lv_obj_set_style_text_color(state_lbl, COLOR_CONNECTED, 0);
+        }
     }
     if (shown == 0) {
         show_wifi_list_message("لا توجد شبكات محفوظة بالمدى حاليًا");
@@ -1965,7 +1983,7 @@ static void do_clear_saved_networks()
 static void show_wifi_reset_confirm_cb(lv_event_t *e)
 {
     LV_UNUSED(e);
-    show_confirm_modal(LV_SYMBOL_TRASH, COLOR_DISCONNECTED,
+    show_confirm_modal(LV_SYMBOL_TRASH, true,
                        "مسح الشبكات؟",
                        "ستُحذف كل الشبكات المحفوظة وتنقطع الساعة عن الإنترنت.",
                        "مسح كل الشبكات", do_clear_saved_networks);
@@ -2343,9 +2361,9 @@ static void stop_ble_provisioning()
 
 // Minimal styling inline (no external CSS) since this is served straight
 // from flash to whatever browser the phone opens — kept deliberately small.
-static const char PORTAL_PAGE_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
+static const char PORTAL_PAGE_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nabeeh Watch Wi-Fi Setup</title>
+<title>إعداد الواي فاي - ساعة نبيه</title>
 <style>
 body{font-family:sans-serif;background:#0B0B1A;color:#fff;display:flex;flex-direction:column;align-items:center;padding:32px 16px;margin:0}
 h1{font-size:20px;margin-bottom:4px}
@@ -2354,13 +2372,13 @@ form{width:100%;max-width:320px;margin-top:24px}
 label{display:block;font-size:13px;color:#A0A0B8;margin-bottom:4px}
 input{width:100%;box-sizing:border-box;padding:10px;margin-bottom:16px;border-radius:8px;border:1px solid #333;background:#181059;color:#fff;font-size:16px}
 .select-wrap{position:relative;margin-bottom:16px}
-.select-wrap select{width:100%;box-sizing:border-box;padding:10px 32px 10px 10px;border-radius:8px;border:1px solid #333;background:#181059;color:#fff;font-size:16px;-webkit-appearance:none;-moz-appearance:none;appearance:none}
-.select-wrap:after{content:'\25BE';position:absolute;right:12px;top:50%;transform:translateY(-50%);color:#A0A0B8;pointer-events:none;font-size:14px}
+.select-wrap select{width:100%;box-sizing:border-box;padding:10px 10px 10px 32px;border-radius:8px;border:1px solid #333;background:#181059;color:#fff;font-size:16px;-webkit-appearance:none;-moz-appearance:none;appearance:none}
+.select-wrap:after{content:'\25BE';position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#A0A0B8;pointer-events:none;font-size:14px}
 option{background:#181059;color:#fff}
 button{width:100%;padding:12px;border-radius:8px;border:none;background:#181059;color:#fff;font-size:16px;font-weight:bold}
 </style></head><body>
-<h1>Nabeeh Watch</h1>
-<p>Connect your watch to Wi-Fi</p>
+<h1>ساعة نبيه</h1>
+<p>اربط ساعتك بشبكة الواي فاي</p>
 )HTML";
 static const char PORTAL_PAGE_TAIL[] PROGMEM = "</body></html>";
 
@@ -2375,17 +2393,17 @@ static void handle_portal_root()
 {
     String page = String(PORTAL_PAGE_HEAD) +
         "<form id=\"wifiForm\" method=\"POST\" action=\"/save\">"
-        "<p>Enter the 3-digit setup code shown on your watch.</p>"
-        "<label>Setup code</label>"
+        "<p>أدخل رمز الإعداد المكوّن من ٣ أرقام والظاهر على شاشة الساعة.</p>"
+        "<label>رمز الإعداد</label>"
         "<input name=\"setup_pin\" inputmode=\"numeric\" pattern=\"[0-9]{3}\" maxlength=\"3\" "
-        "placeholder=\"000\" autocomplete=\"one-time-code\" required>"
-        "<label>Wi-Fi network</label>"
-        "<div class=\"select-wrap\"><select id=\"ssidSelect\" disabled><option value=\"\">Scanning for networks…</option></select></div>"
-        "<input type=\"text\" id=\"ssidManual\" name=\"ssid\" placeholder=\"Network name\" style=\"display:none\" "
+        "placeholder=\"000\" dir=\"ltr\" autocomplete=\"one-time-code\" required>"
+        "<label>شبكة الواي فاي</label>"
+        "<div class=\"select-wrap\"><select id=\"ssidSelect\" disabled><option value=\"\">جارٍ البحث عن الشبكات…</option></select></div>"
+        "<input type=\"text\" id=\"ssidManual\" name=\"ssid\" placeholder=\"اسم الشبكة\" dir=\"auto\" style=\"display:none\" "
         "maxlength=\"63\" autocapitalize=\"off\" autocorrect=\"off\" autocomplete=\"off\">"
-        "<label>Wi-Fi password</label>"
-        "<input name=\"password\" type=\"password\" maxlength=\"63\" autocomplete=\"off\">"
-        "<button type=\"submit\">Connect</button>"
+        "<label>كلمة مرور الشبكة</label>"
+        "<input name=\"password\" type=\"password\" dir=\"ltr\" maxlength=\"63\" autocomplete=\"off\">"
+        "<button type=\"submit\">اتصال</button>"
         "</form>"
         "<script>"
         "var OTHER='__other__';"
@@ -2399,13 +2417,13 @@ static void handle_portal_root()
         "    var sel=document.getElementById('ssidSelect');"
         "    sel.innerHTML='';"
         "    if(!data.networks||data.networks.length===0){"
-        "      var o=document.createElement('option');o.value='';o.textContent='No networks found nearby';sel.appendChild(o);"
+        "      var o=document.createElement('option');o.value='';o.textContent='لا توجد شبكات قريبة';sel.appendChild(o);"
         "    } else {"
         "      data.networks.forEach(function(name){"
         "        var o=document.createElement('option');o.value=name;o.textContent=name;sel.appendChild(o);"
         "      });"
         "    }"
-        "    var other=document.createElement('option');other.value=OTHER;other.textContent='Other (type manually)';sel.appendChild(other);"
+        "    var other=document.createElement('option');other.value=OTHER;other.textContent='شبكة أخرى (إدخال الاسم يدويًا)';sel.appendChild(other);"
         "    sel.disabled=false;"
         "    syncManual();"
         "  }).catch(function(){setTimeout(poll,2000);});"
@@ -2417,7 +2435,7 @@ static void handle_portal_root()
         "    var sel=document.getElementById('ssidSelect');"
         "    var manual=document.getElementById('ssidManual');"
         "    if(sel.value!==OTHER){manual.value=sel.value;}"
-        "    if(!manual.value){e.preventDefault();alert('Choose a network or type its name.');}"
+        "    if(!manual.value){e.preventDefault();alert('يُرجى اختيار شبكة أو إدخال اسمها.');}"
         "  });"
         "});"
         "</script>" + String(PORTAL_PAGE_TAIL);
@@ -2499,8 +2517,8 @@ static void handle_portal_save()
     if (setup_pin != wifi_setup_pin) {
         portal_server.send(403, "text/html",
             String(PORTAL_PAGE_HEAD) +
-            "<p style=\"color:#ff8080\">Incorrect setup code. Check the watch and try again.</p>"
-            "<button onclick=\"history.back()\">Go back</button>" +
+            "<p style=\"color:#ff8080\">رمز الإعداد غير صحيح. تحقّق من الرمز الظاهر على الساعة وحاول مرة أخرى.</p>"
+            "<button onclick=\"history.back()\">رجوع</button>" +
             String(PORTAL_PAGE_TAIL));
         Serial.println("Wi-Fi AP provisioning: rejected credentials with an incorrect setup code.");
         return;
@@ -2509,7 +2527,7 @@ static void handle_portal_save()
     if (ssid.length() == 0 || ssid.length() >= sizeof(pending_wifi_ssid) || pass.length() >= sizeof(pending_wifi_pass)) {
         portal_server.send(400, "text/html",
             String(PORTAL_PAGE_HEAD) +
-            "<p style=\"color:#ff8080\">Network name missing or too long — go back and try again.</p>" +
+            "<p style=\"color:#ff8080\">اسم الشبكة فارغ أو طويل جدًا. يُرجى الرجوع والمحاولة مرة أخرى.</p>" +
             String(PORTAL_PAGE_TAIL));
         return;
     }
@@ -2522,7 +2540,7 @@ static void handle_portal_save()
 
     portal_server.send(200, "text/html",
         String(PORTAL_PAGE_HEAD) +
-        "<p>Saved. Your watch is reconnecting now — this page can be closed.</p>" +
+        "<p>تم الحفظ. تتصل الساعة بالشبكة الآن، ويمكنك إغلاق هذه الصفحة.</p>" +
         String(PORTAL_PAGE_TAIL));
     Serial.printf("Wi-Fi AP provisioning: received new SSID '%s'\n", pending_wifi_ssid);
 }
